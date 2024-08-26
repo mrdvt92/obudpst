@@ -39,7 +39,9 @@
 #ifndef UDPST_H
 #define UDPST_H
 
+#ifdef __linux__
 #include "config.h"
+#endif /* __linux__ */
 #include "udpst_common.h"
 
 //----------------------------------------------------------------------------
@@ -51,7 +53,8 @@
 #define DSTEST_TEXT       "Downstream"
 #define TIME_FORMAT       "%Y-%m-%d %H:%M:%S"
 #define STRING_SIZE       1024               // String buffer size
-#define AUTH_KEY_SIZE     32                 // Authentication key size
+#define AUTH_KEY_SIZE     64                 // Authentication key size
+#define MAX_KEY_ENTRIES   256                // Maximum key entries
 #define HS_DELTA_BACKUP   3                  // High-speed delta backup multiplier
 #define MAX_SERVER_CONN   256                // Max server connections
 #define MAX_CLIENT_CONN   (MAX_MC_COUNT + 1) // Max client connections (plus aggregate)
@@ -61,19 +64,48 @@
 #define MAX_RANDOM_START  50                 // Maximum used for random I/O start (ms)
 #define AUTH_TIME_WINDOW  150                // Authentication +/- time windows (sec)
 #define AUTH_ENFORCE_TIME TRUE               // Enforce authentication time window
+#define ALERT_MSG_LIMIT   10                 // Alert message limit
+#define INFO_MSG_LIMIT    10                 // Info message limit (per connection)
 #define WARNING_MSG_LIMIT 10                 // Warning message limit (per connection)
 #define WARNING_NOTRAFFIC 1                  // Receive traffic stopped warning threshold (sec)
 #define TIMEOUT_NOTRAFFIC (WARNING_NOTRAFFIC + 2)
-#define STATUS_SUCCESS    0  // Success (test completed without incident)
-#define STATUS_WARNING    1  // Warning or soft error (test runs but with anomaly)
-#define STATUS_ERROR      -1 // Failure or hard error (test designated as failure)
+//
+// General status and status base values for warning and error ranges (ErrorStatus)
+//   See udpst_protocol.h for CHSR_CRSP_XXXX and CHTA_CRSP_XXXX values
+//
+#define STATUS_SUCCESS      0   // Success (test completed without incident)
+#define STATUS_WARNBASE     1   // Warnings and soft errors
+#define STATUS_WARNMAX      49  // Warning and soft error maximum
+#define STATUS_CONF_ERRBASE 50  // Configuration errors
+#define STATUS_INIT_ERRBASE 75  // Initialization errors
+#define CHSR_CRSP_ERRBASE   100 // Setup request errors (offset by CHSR_CRSP_XXXX)
+#define CHTA_CRSP_ERRBASE   150 // Test activation errors (offset by CHTA_CRSP_XXXX)
+#define STATUS_CONN_ERRBASE 200 // Connection errors
+#define STATUS_ERROR        255 // General or unspecified error
+// Warnings (offset of STATUS_WARNBASE)
+#define WARN_SRV_TIMEOUT 0 // Server response timeout
+#define WARN_LOC_STATUS  1 // Locally received status messages lost
+#define WARN_REM_STATUS  2 // Remotely received status messages lost
+#define WARN_LOC_STOPPED 3 // Locally received traffic has stopped
+#define WARN_REM_STOPPED 4 // Remotely received traffic has stopped
+#define WARN_RX_INVPDU   5 // Received invalid PDU
+// Configuration errors (offset of STATUS_CONF_ERRBASE)
+#define ERROR_CONF_GENERIC 0 // Generic configuration issue
+#define ERROR_CONF_KEYFILE 1 // Configuration issue with/within key file
+// Initialization errors (offset of STATUS_INIT_ERRBASE)
+#define ERROR_INIT_GENERIC 0 // Generic configuration issue
+// Connection errors (offset of STATUS_CONN_ERRBASE)
+#define ERROR_CONN_MIN 0 // Minimum connections unavailable
+//
 // Alternative for INET6_ADDRSTRLEN (allows for '%' and textual Zone ID)
+//
 #define INET6_ADDR_STRLEN (INET6_ADDRSTRLEN + 1 + IFNAMSIZ)
-
+//
 // DISABLE_INT_TIMER disables the interval timer when compiling for client
 // devices that are unable to support the required clock resolution. Because
 // this results in high CPU utilization, it is not recommended for standard
 // server operation.
+//
 #ifndef DISABLE_INT_TIMER
 #define SEND_TIMER_ADJ 75 // Data send timer adjustment (us)
 #else
@@ -134,9 +166,12 @@
 #define MIN_LOGFILE_MAX      10             //
 #define MAX_LOGFILE_MAX      1000000        //
 #define MIN_REQUIRED_BW      1              // Required OR available bandwidth (Mbps)
-#define MAX_CLIENT_BW        10000          //
+#define MAX_CLIENT_BW        INT16_MAX      // (MSb for direction [CHSR_USDIR_BIT])
 #define MAX_SERVER_BW        100000         //
 #define DEF_RA_ALGO          CHTA_RA_ALGO_B // Default rate adjustment algorithm
+#define DEF_KEY_ID           0              // Key ID
+#define MIN_KEY_ID           0              //
+#define MAX_KEY_ID           UINT8_MAX      //
 
 //----------------------------------------------------------------------------
 //
@@ -231,7 +266,9 @@ struct configuration {
         int bimodalCount;                // Bimodal initial sub-interval count
         BOOL useOwDelVar;                // Use one-way delay instead of RTT
         BOOL ignoreOooDup;               // Ignore Out-of-Order/Duplicate datagrams
-        char authKey[AUTH_KEY_SIZE + 1]; // Authentication key
+        char authKey[AUTH_KEY_SIZE + 4]; // Authentication key (from command-line)
+        int keyId;                       // Authentication key ID
+        char *keyFile;                   // Authentication key file
         int ipTosByte;                   // IP ToS byte for testing
         int srIndexConf;                 // Configured sending rate index
         BOOL srIndexIsStart;             // Configured SR index is starting point
@@ -248,14 +285,20 @@ struct configuration {
         int seqErrThresh;                // Sequence error threshold
         int maxBandwidth;                // Required OR available bandwidth
         BOOL intfForMax;                 // Local interface used for maximum
-        char intfName[IFNAMSIZ + 1];     // Local interface for supplemental stats
+        char intfName[IFNAMSIZ + 4];     // Local interface for supplemental stats
         int logFileMax;                  // Maximum log file size
         char *logFile;                   // Name of log file
+        char *outputFile;                // Name of output (export) file
 };
 //----------------------------------------------------------------------------
 //
 // Repository of global variables and structures
 //
+#define KEY_ENTRY_FIELDS 2
+struct keyEntry {
+        int id;                      // Key ID
+        char key[AUTH_KEY_SIZE + 4]; // Key string
+};
 struct serverId {
         char *name;                 // Server hostname or IP address
         char ip[INET6_ADDR_STRLEN]; // Server IP address
@@ -307,7 +350,7 @@ struct repository {
         double siAggRateL0;                   // Sub-interval L1+VLAN aggregate rate
         struct testSummary testSum;           // Test summary statistics
         int intfFD;                           // File descriptor to read interface stats
-        unsigned long intfBytes;              // Last byte counter of interface stats
+        unsigned long long intfBytes;         // Last byte counter of interface stats
         struct timespec intfTime;             // Sample time of interface stats
         struct timespec timeOfMax[2];         // Time of maximums (bimodal)
         int actConnections[2];                // Active testing connections (bimodal)
@@ -318,6 +361,9 @@ struct repository {
         double rateMaxL0[2];                  // L1+VLAN rate maximums (bimodal)
         double intfMax[2];                    // Interface maximums (bimodal)
         double intfMbps;                      // Last interface rate obtained
+        int keyIndex;                         // Key index (used by client)
+        int keyCount;                         // Number of keys defined
+        struct keyEntry key[MAX_KEY_ENTRIES]; // Array of key entries
 };
 //----------------------------------------------------------------------------
 //
@@ -355,6 +401,7 @@ struct connection {
         int locPort;                     // Local port
         char remAddr[INET6_ADDR_STRLEN]; // Remote IP address as string
         int remPort;                     // Remote port
+        FILE *outputFPtr;                // Output file pointer
         //
         int srIndex;                 // Sending rate index
         struct sendingRate srStruct; // Sending rate structure
@@ -427,6 +474,7 @@ struct connection {
         unsigned int tiRxDatagrams;    // Trial interval receive datagrams
         unsigned int tiRxBytes;        // Trial interval receive bytes
         //
+        int infoCount;             // Info message count
         int warningCount;          // Warning message count
         BOOL rxStoppedLoc;         // Local receive traffic stopped indicator
         BOOL rxStoppedRem;         // Remote receive traffic stopped indicator

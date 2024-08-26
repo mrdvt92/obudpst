@@ -69,10 +69,14 @@
  * Len Ciavattone          03/22/2023    Add GSO and GRO optimizations
  * Len Ciavattone          03/25/2023    GRO replaced w/recvmmsg+truncation
  * Len Ciavattone          04/04/2023    Add optional rate limiting
+ * Len Ciavattone          05/24/2023    Add data output (export) capability
+ * Len Ciavattone          10/01/2023    Updated ErrorStatus values
+ * Len Ciavattone          12/08/2023    Always handle intf counters as 64-bit
+ * Len Ciavattone          02/23/2024    Add status feedback loss to export
+ * Len Ciavattone          04/12/2024    Enhanced data PDU integrity checks
+ * Len Ciavattone          06/24/2024    Add interface Mbps to export
  *
  */
-
-#include "config.h"
 
 #define UDPST_DATA
 #ifdef __linux__
@@ -126,6 +130,7 @@ void output_warning(int, int);
 double upd_intf_stats(BOOL);
 void output_minimum(int);
 void output_debug(int);
+BOOL verify_datapdu(int, struct loadHdr *, struct statusHdr *);
 
 //----------------------------------------------------------------------------
 //
@@ -138,24 +143,20 @@ extern struct repository repo;
 extern struct connection *conn;
 //
 extern cJSON *json_top, *json_output, *json_siArray;
-extern char json_errbuf[STRING_SIZE];
+extern char json_errbuf[STRING_SIZE], json_errbuf2[STRING_SIZE];
 
 //----------------------------------------------------------------------------
 //
 // Global data
 //
-#define WARN_LOC_STATUS  0 // Locally received status messages lost
-#define WARN_REM_STATUS  1 // Remotely received status messages lost
-#define WARN_LOC_STOPPED 2 // Locally received traffic has stopped
-#define WARN_REM_STOPPED 3 // Remotely received traffic has stopped
-#define LOSSRATIO_TEXT   "LossRatio: %.2E, "
-#define DELIVERED_TEXT   "Delivered(%%): %6.2f, "
-#define SUMMARY_TEXT     "Loss/OoO/Dup: %u/%u/%u, OWDVar(ms): %u/%u/%u, RTTVar(ms): %u-%u, Mbps(L3/IP): %.2f%s\n"
-#define MINIMUM_TEXT     "Minimum One-Way Delay(ms): %d [w/clock diff], Round-Trip Time(ms): %u"
-#define MINIMUM_FINAL    MINIMUM_TEXT ", Active Connections: %d\n"
-#define DEBUG_STATS      "[Loss/OoO/Dup: %u/%u/%u, OWDVar(ms): %u/%u/%u, RTTVar(ms): %d]"
-#define CLIENT_DEBUG     "[%d]DEBUG Status Feedback " DEBUG_STATS " Mbps(L3/IP): %.2f\n"
-#define SERVER_DEBUG     "[%d]DEBUG Rate Adjustment " DEBUG_STATS " SRIndex: %d\n"
+#define LOSSRATIO_TEXT "LossRatio: %.2E, "
+#define DELIVERED_TEXT "Delivered(%%): %6.2f, "
+#define SUMMARY_TEXT   "Loss/OoO/Dup: %u/%u/%u, OWDVar(ms): %u/%u/%u, RTTVar(ms): %u-%u, Mbps(L3/IP): %.2f%s\n"
+#define MINIMUM_TEXT   "Minimum One-Way Delay(ms): %d [w/clock diff], Round-Trip Time(ms): %u"
+#define MINIMUM_FINAL  MINIMUM_TEXT ", Active Connections: %d\n"
+#define DEBUG_STATS    "[Loss/OoO/Dup: %u/%u/%u, OWDVar(ms): %u/%u/%u, RTTVar(ms): %d]"
+#define CLIENT_DEBUG   "[%d]DEBUG Status Feedback " DEBUG_STATS " Mbps(L3/IP): %.2f\n"
+#define SERVER_DEBUG   "[%d]DEBUG Rate Adjustment " DEBUG_STATS " SRIndex: %d\n"
 static char scratch2[STRING_SIZE + 32]; // Allow for log file timestamp prefix
 static int mmsgDataSize[RECVMMSG_SIZE]; // Received data size of each message
 
@@ -177,7 +178,7 @@ static void _populate_header(struct loadHdr *lHdr, struct connection *c, unsigne
         lHdr->lpduTime_sec  = htonl((uint32_t) repo.systemClock.tv_sec);
         lHdr->lpduTime_nsec = htonl((uint32_t) repo.systemClock.tv_nsec);
         lHdr->rttRespDelay  = htons((uint16_t) rttRespDelay);
-        lHdr->reserved1     = 0;
+        lHdr->checkSum      = 0; // Updated in send function if needed
 }
 //
 // Randomize payload of datagram (via single call of random())
@@ -278,6 +279,10 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
                         _populate_header(lHdr, c, rttrd);
                         lHdr->lpduSeqNo  = htonl((uint32_t) ++c->lpduSeqNo);
                         lHdr->udpPayload = htons((uint16_t) uvar);
+#ifdef ADD_HEADER_CSUM
+                        if (c->protocolVer >= CHECKSUM_PVER)
+                                lHdr->checkSum = checksum(lHdr, sizeof(struct loadHdr));
+#endif
                         if (c->randPayload) {
                                 _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
                         }
@@ -341,7 +346,7 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
                 }
         }
 }
-#endif // HAVE_GSO
+#else
 
 //
 // Send a burst of messages using the Linux 3.0+ only sendmmsg syscall
@@ -381,6 +386,10 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
                 else
                         uvar = addon;
                 lHdr->udpPayload = htons((uint16_t) uvar);
+#ifdef ADD_HEADER_CSUM
+                if (c->protocolVer >= CHECKSUM_PVER)
+                        lHdr->checkSum = checksum(lHdr, sizeof(struct loadHdr));
+#endif
                 if (c->randPayload) {
                         _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
                 }
@@ -418,7 +427,8 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
                 }
         }
 }
-#endif // HAVE_SENDMMSG
+#endif // HAVE_GSO
+#else
 
 //
 // Send a burst of messages using the slower but more widely available sendmsg syscall
@@ -459,6 +469,11 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
                 else
                         uvar = addon;
                 lHdr->udpPayload = htons((uint16_t) uvar);
+#ifdef ADD_HEADER_CSUM
+                lHdr->checkSum   = 0; // Zero on each pass because _populate_header() is only called once
+                if (c->protocolVer >= CHECKSUM_PVER)
+                        lHdr->checkSum = checksum(lHdr, sizeof(struct loadHdr));
+#endif
                 if (c->randPayload) {
                         _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
                 }
@@ -488,6 +503,7 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
                 }
         }
 }
+#endif // HAVE_SENDMMSG
 
 //
 // Send load PDUs via periodic timers for transmitters 1 & 2
@@ -501,7 +517,7 @@ int send2_loadpdu(int connindex) {
 int send_loadpdu(int connindex, int transmitter) {
         register struct connection *c = &conn[connindex];
         int var, burstsize, totalburst, txintpri, txintalt;
-        unsigned int uvar, payload, addon;
+        unsigned int payload, addon;
         BOOL randpayload;
         struct timespec tspecvar, *tspecpri, *tspecalt;
         struct sendingRate *sr;
@@ -576,8 +592,8 @@ int send_loadpdu(int connindex, int transmitter) {
                         //
                         tspeccpy(&c->endTime, &repo.systemClock);
                 }
-                if (repo.endTimeStatus < STATUS_WARNING) // If no explicit warnings, declare success
-                        repo.endTimeStatus = STATUS_SUCCESS;
+                if (repo.endTimeStatus > STATUS_WARNMAX)     // Declare success, but retain warnings
+                        repo.endTimeStatus = STATUS_SUCCESS; // ErrorStatus
         }
 
         //
@@ -673,14 +689,15 @@ int service_loadpdu(int connindex) {
         register struct connection *c = &conn[connindex];
         int i, delta, var;
         BOOL bvar, firstpdu = FALSE;
-        unsigned int uvar, seqno, rttrd;
+        unsigned int uvar, seqno, rttrd, payload;
         struct loadHdr *lHdr = (struct loadHdr *) repo.rcvDataPtr;
         struct timespec tspecvar, tspecdelta;
+        char *nulloutput = ",,,,,\n";
 
         //
         // Verify PDU
         //
-        if (repo.rcvDataSize < (int) sizeof(struct loadHdr) || ntohs(lHdr->loadId) != LOAD_ID) {
+        if (!verify_datapdu(connindex, lHdr, NULL)) {
                 return 0; // Ignore bad PDU
         }
 
@@ -734,26 +751,13 @@ int service_loadpdu(int connindex) {
         }
 
         //
-        // Generate warning if peer indicates status message sequence errors
-        //
-        if ((var = (int) ntohs(lHdr->spduSeqErr)) != c->spduSeqErr) {
-                c->spduSeqErr = var;     // Save value if changed
-                if (c->spduSeqErr > 0) { // Only warn if count indicates loss
-                        if (c->warningCount < WARNING_MSG_LIMIT) {
-                                c->warningCount++;
-                                output_warning(connindex, WARN_REM_STATUS);
-                        }
-                }
-        }
-
-        //
         // Update traffic stats (use size specified in PDU, actual receive may have been truncated)
         //
-        uvar = (unsigned int) ntohs(lHdr->udpPayload);
+        payload = (unsigned int) ntohs(lHdr->udpPayload);
         c->sisAct.rxDatagrams++;
-        c->sisAct.rxBytes += (uint64_t) uvar;
+        c->sisAct.rxBytes += (uint64_t) payload;
         c->tiRxDatagrams++;
-        c->tiRxBytes += uvar;
+        c->tiRxBytes += payload;
 
         //
         // Check sequence number for loss, also reordering/duplication (end processing if so)
@@ -808,10 +812,26 @@ int service_loadpdu(int connindex) {
                 }
         }
         if (var < 2) {
-                c->lpduHistBuf[c->lpduHistIdx] = seqno;                                // Save sequence number in history buffer
-                c->lpduHistIdx                 = ++c->lpduHistIdx & LPDU_HISTORY_MASK; // Update history buffer index
+                c->lpduHistBuf[c->lpduHistIdx] = seqno; // Save sequence number in history buffer
+                ++c->lpduHistIdx;                       // Advance history buffer index
+                c->lpduHistIdx &= LPDU_HISTORY_MASK;    // Maintain index limit
+        }
+        //
+        // Calculate one-way clock delta (used again further down)
+        //
+        tspecvar.tv_sec  = (time_t) ntohl(lHdr->lpduTime_sec);
+        tspecvar.tv_nsec = (long) ntohl(lHdr->lpduTime_nsec);
+        tspecminus(&repo.systemClock, &tspecvar, &tspecdelta);
+        delta = (int) tspecmsec(&tspecdelta);
+        if (c->outputFPtr != NULL) { // Start output data with one-way values
+                fprintf(c->outputFPtr, "%u,%u,%ld.%06ld,%ld.%06ld,%d,%.2f", seqno, payload, (long) tspecvar.tv_sec,
+                        tspecvar.tv_nsec / NSECINUSEC, (long) repo.systemClock.tv_sec, repo.systemClock.tv_nsec / NSECINUSEC, delta,
+                        repo.intfMbps);
         }
         if (var > 0) {
+                if (c->outputFPtr != NULL) { // Finalize output data with null entries
+                        fputs(nulloutput, c->outputFPtr);
+                }
                 return 0; // No further processing for non-increasing sequence numbers
         }
 
@@ -833,6 +853,21 @@ int service_loadpdu(int connindex) {
                         uvar = 0;
                 }
                 //
+                // Generate warning if peer indicates status message sequence errors
+                //
+                c->spduSeqErr = (int) ntohs(lHdr->spduSeqErr);
+                if (c->spduSeqErr > 0) { // Only warn if count indicates loss
+                        if (c->warningCount < WARNING_MSG_LIMIT) {
+                                c->warningCount++;
+                                output_warning(connindex, WARN_REM_STATUS);
+                        }
+                }
+                if (c->outputFPtr != NULL) { // Finalize output data with RTT values
+                        fprintf(c->outputFPtr, ",%ld.%06ld,%ld.%06ld,%u,%u,%d\n", (long) tspecvar.tv_sec,
+                                tspecvar.tv_nsec / NSECINUSEC, (long) repo.systemClock.tv_sec,
+                                repo.systemClock.tv_nsec / NSECINUSEC, rttrd, uvar, c->spduSeqErr);
+                }
+                //
                 // Check for new minimum
                 //
                 if (uvar < c->rttMinimum) {
@@ -848,15 +883,15 @@ int service_loadpdu(int connindex) {
                 if (c->rttSample > (unsigned int) c->sisAct.rttMaximum)
                         c->sisAct.rttMaximum = (uint32_t) c->rttSample;
                 tspeccpy(&c->spduTime, &tspecvar); // Save to detect updated value
+        } else {
+                if (c->outputFPtr != NULL) { // Finalize output data with null entries
+                        fputs(nulloutput, c->outputFPtr);
+                }
         }
 
         //
-        // Calculate one-way clock delta and delay variation for this load PDU
+        // Process one-way clock delta (calculated above) and delay variation for this load PDU
         //
-        tspecvar.tv_sec  = (time_t) ntohl(lHdr->lpduTime_sec);
-        tspecvar.tv_nsec = (long) ntohl(lHdr->lpduTime_nsec);
-        tspecminus(&repo.systemClock, &tspecvar, &tspecdelta);
-        delta = (int) tspecmsec(&tspecdelta);
         if (firstpdu) {
                 c->clockDeltaMin = delta;
                 c->delayMinUpd   = TRUE;
@@ -919,8 +954,8 @@ int send_statuspdu(int connindex) {
                         //
                         tspeccpy(&c->endTime, &repo.systemClock);
                 }
-                if (repo.endTimeStatus < STATUS_WARNING) // If no explicit warnings, declare success
-                        repo.endTimeStatus = STATUS_SUCCESS;
+                if (repo.endTimeStatus > STATUS_WARNMAX)     // Declare success, but retain warnings
+                        repo.endTimeStatus = STATUS_SUCCESS; // ErrorStatus
         } else {
                 tspecvar.tv_sec  = 0;
                 tspecvar.tv_nsec = (long) (c->trialInt * NSECINMSEC);
@@ -930,8 +965,9 @@ int send_statuspdu(int connindex) {
                 // Only continue if some data has been received (initial load PDUs could still be in transit)
                 //
                 if (c->lpduSeqNo == 0) {
-                        if (conf.verbose) {
-                                var = sprintf(scratch, "[%d]Skipping status transmission, awaiting initial load PDUs...\n",
+                        if (c->infoCount < INFO_MSG_LIMIT && conf.verbose) {
+                                c->infoCount++;
+                                var = sprintf(scratch, "[%d]INFO: Skipping status transmission, awaiting initial load PDUs...\n",
                                               connindex);
                                 send_proc(monConn, scratch, var);
                         }
@@ -1012,8 +1048,8 @@ int send_statuspdu(int connindex) {
         sHdr->rttMinimum    = htonl(c->rttMinimum);
         sHdr->rttSample     = htonl(c->rttSample);
         sHdr->delayMinUpd   = (uint8_t) c->delayMinUpd;
-        sHdr->reserved2     = 0;
-        sHdr->reserved3     = 0;
+        sHdr->reserved1     = 0;
+        sHdr->checkSum      = 0;
 
         //
         // Include trial interval info
@@ -1029,6 +1065,10 @@ int send_statuspdu(int connindex) {
         //
         sHdr->spduTime_sec  = htonl((uint32_t) repo.systemClock.tv_sec);
         sHdr->spduTime_nsec = htonl((uint32_t) repo.systemClock.tv_nsec);
+#ifdef ADD_HEADER_CSUM
+        if (c->protocolVer >= CHECKSUM_PVER)
+                sHdr->checkSum = checksum(sHdr, sizeof(struct statusHdr));
+#endif
         if (!repo.isServer) {
                 //
                 // Output verbose/debug messages if configured
@@ -1101,7 +1141,7 @@ int send_statuspdu(int connindex) {
 //
 int service_statuspdu(int connindex) {
         register struct connection *c = &conn[connindex];
-        int var, var2;
+        int var;
         BOOL bvar;
         unsigned int uvar, seqno;
         struct statusHdr *sHdr = (struct statusHdr *) repo.defBuffer;
@@ -1110,7 +1150,7 @@ int service_statuspdu(int connindex) {
         //
         // Verify PDU
         //
-        if (repo.rcvDataSize < (int) sizeof(struct statusHdr) || ntohs(sHdr->statusId) != STATUS_ID) {
+        if (!verify_datapdu(connindex, NULL, sHdr)) {
                 return 0; // Ignore bad PDU
         }
 
@@ -1449,7 +1489,6 @@ int adjust_sending_rate(int connindex) {
 int proc_subinterval(int connindex, BOOL initialize) {
         register struct connection *c = &conn[connindex];
         struct timespec tspecvar;
-        int var;
 
         //
         // If not doing initialization
@@ -1500,13 +1539,11 @@ int agg_query_proc(int connindex) {
         // Query aggregate connection and overall state of testing
         //
         if (repo.actConnCount < conf.minConnCount) { // Active test count is below minimum
-                if (!conf.jsonOutput) {
-                        // Do not overwrite any previous error in json error buffer if json configured
-                        var = sprintf(scratch, "ERROR: Minimum required connections (%d) unavailable\n", conf.minConnCount);
-                        send_proc(errConn, scratch, var);
-                }
-                repo.endTimeStatus = STATUS_ERROR;        // Force status to error
-                tspeccpy(&a->endTime, &repo.systemClock); // Trigger process shutdown
+                var = sprintf(scratch, "ERROR: Minimum required connections (%d) unavailable\n", conf.minConnCount);
+                send_proc(errConn, scratch, var);
+                if (repo.endTimeStatus <= STATUS_WARNMAX)                          // Retain any original error
+                        repo.endTimeStatus = STATUS_CONN_ERRBASE + ERROR_CONN_MIN; // ErrorStatus
+                tspeccpy(&a->endTime, &repo.systemClock);                          // Trigger process shutdown
 
         } else if (repo.maxConnIndex == aggConn) { // All test connections finished/failed (only aggregate exists)
                 //
@@ -2139,7 +2176,6 @@ int recv_proc(int connindex) {
         static struct iovec iov[RECVMMSG_SIZE];    // Static array
         char *rcvbuf;
         int i, var, recvsize;
-        struct msghdr *msg;
 
         //
         // Specify receive buffer size (truncate load PDUs to reduce overhead of memory copy)
@@ -2223,9 +2259,12 @@ int send_proc(int connindex, char *sendbuffer, int sendsize) {
         char *buf;
 
         //
-        // If JSON is configured save error message in JSON error buffer
+        // If JSON is configured save error message in JSON error buffer(s)
         //
         if (conf.jsonOutput && c->type == T_CONSOLE && connindex == errConn) {
+                if (*json_errbuf != '\0') {
+                        strcpy(json_errbuf2, json_errbuf); // Save primary to supplementary
+                }
                 snprintf(json_errbuf, STRING_SIZE, "%s", sendbuffer);
                 //
                 buf = json_errbuf;
@@ -2409,6 +2448,7 @@ void output_warning(int connindex, int type) {
                 switch (type) {
                 case WARN_LOC_STATUS:
                         strcpy(location, "LOCAL");
+                        /* FALLTHROUGH */ // Eventually replace comment with [[fallthrough]];
                 case WARN_REM_STATUS:
                         if (*location == '\0')
                                 strcpy(location, "REMOTE");
@@ -2417,6 +2457,7 @@ void output_warning(int connindex, int type) {
                         break;
                 case WARN_LOC_STOPPED:
                         strcpy(location, "LOCAL");
+                        /* FALLTHROUGH */ // Eventually replace comment with [[fallthrough]];
                 case WARN_REM_STOPPED:
                         if (*location == '\0')
                                 strcpy(location, "REMOTE");
@@ -2430,7 +2471,7 @@ void output_warning(int connindex, int type) {
                         }
                         scratch[var++] = '\n';
                         send_proc(errConn, scratch, var);
-                        repo.endTimeStatus = STATUS_WARNING;
+                        repo.endTimeStatus = STATUS_WARNBASE + type; // ErrorStatus
                 }
         }
         return;
@@ -2455,7 +2496,7 @@ int create_timestamp(struct timespec *tspecvar) {
 //
 double upd_intf_stats(BOOL initialize) {
         int var;
-        unsigned long intfbytes; // Use unsigned long to support 64-bit counters with 64-bit OS
+        unsigned long long intfbytes; // Always handle counters as 64-bit values
         double mbps = 0.0;
         struct timespec tspecvar;
         char buffer[32];
@@ -2465,15 +2506,18 @@ double upd_intf_stats(BOOL initialize) {
         }
         if ((var = (int) read(repo.intfFD, buffer, sizeof(buffer))) > 0) {
                 buffer[var] = '\0';
-                if ((intfbytes = strtoul(buffer, NULL, 10)) > 0) {
+                if ((intfbytes = strtoull(buffer, NULL, 10)) > 0) {
                         if (!initialize) {
                                 if (tspecisset(&repo.intfTime)) {
                                         tspecminus(&repo.systemClock, &repo.intfTime, &tspecvar);
                                         if (intfbytes >= repo.intfBytes) {
                                                 mbps = (double) (intfbytes - repo.intfBytes);
-                                        } else {
-                                                // Counter wrapped
-                                                mbps = (double) ((ULONG_MAX - repo.intfBytes) + intfbytes + 1);
+                                        } else { // Counter wrapped (allow for 32 or 64-bit wrap threshold)
+                                                if (repo.intfBytes <= 4294967295ULL) {
+                                                        mbps = (double) ((4294967295ULL - repo.intfBytes) + intfbytes + 1);
+                                                } else {
+                                                        mbps = (double) ((ULLONG_MAX - repo.intfBytes) + intfbytes + 1);
+                                                }
                                         }
                                         mbps *= 8.0;
                                         mbps /= (double) tspecusec(&tspecvar);
@@ -2529,5 +2573,110 @@ void output_debug(int connindex) {
         send_proc(monConn, scratch, var);
 
         return;
+}
+//----------------------------------------------------------------------------
+//
+// Header checksum calculation (needed when the UDP checksum is not being utilized)
+//
+unsigned short checksum(register void *p, register int count) {
+        register unsigned long long sum = 0;
+
+        while (count >= 4) {
+                sum += *((unsigned int *) p);
+                count -= 4;
+                p += 4;
+        }
+        if (count >= 2) {
+                sum += *((unsigned short *) p);
+                count -= 2;
+                p += 2;
+        }
+        if (count == 1) {
+                sum += *((unsigned char *) p);
+        }
+        while (sum >> 32) { // Fold sum to 32 bits
+                sum = (sum & 0xffffffff) + (sum >> 32);
+        }
+        while (sum >> 16) { // Fold sum to 16 bits
+                sum = (sum & 0xffff) + (sum >> 16);
+        }
+        return (unsigned short) ~sum;
+}
+//----------------------------------------------------------------------------
+//
+// Verify data PDU integrity
+//
+BOOL verify_datapdu(int connindex, struct loadHdr *lHdr, struct statusHdr *sHdr) {
+        register struct connection *c = &conn[connindex];
+        int var;
+        BOOL bvar;
+        char connid[8];
+
+        //
+        // Perform PDU verification
+        //
+        bvar = FALSE;
+        if (lHdr) {
+                if (repo.rcvDataSize < (int) sizeof(struct loadHdr)) {
+                        bvar = TRUE;
+                } else if (ntohs(lHdr->loadId) != LOAD_ID) {
+                        bvar = TRUE;
+                } else if (lHdr->testAction > TEST_ACT_MAX) {
+                        bvar = TRUE;
+                } else if (lHdr->rxStopped != FALSE && lHdr->rxStopped != TRUE) {
+                        bvar = TRUE;
+                } else if (c->protocolVer >= CHECKSUM_PVER && lHdr->checkSum != 0) {
+                        if (checksum(lHdr, sizeof(struct loadHdr)))
+                                bvar = TRUE;
+                }
+        } else {
+                if (repo.rcvDataSize != (int) sizeof(struct statusHdr)) {
+                        bvar = TRUE;
+                } else if (ntohs(sHdr->statusId) != STATUS_ID) {
+                        bvar = TRUE;
+                } else if (sHdr->testAction > TEST_ACT_MAX) {
+                        bvar = TRUE;
+                } else if (sHdr->rxStopped != FALSE && sHdr->rxStopped != TRUE) {
+                        bvar = TRUE;
+                } else if (c->protocolVer >= CHECKSUM_PVER && sHdr->checkSum != 0) {
+                        if (checksum(sHdr, sizeof(struct statusHdr)))
+                                bvar = TRUE;
+                }
+        }
+
+        //
+        // Process verification failure and generate warning if not suppressed
+        //
+        if (bvar) {
+#ifdef SUPP_INVPDU_WARN
+                bvar = FALSE; // Flip boolean to suppress output
+#endif
+                if (bvar && c->warningCount < WARNING_MSG_LIMIT && (!repo.isServer || conf.verbose)) {
+                        c->warningCount++;
+
+                        *connid = '\0';
+                        if (conf.verbose)
+                                sprintf(connid, "[%d]", connindex);
+                        //
+                        var = sprintf(scratch, "%sWARNING: Received invalid", connid);
+                        if (lHdr) {
+                                var += sprintf(&scratch[var], " load PDU (%d,0x%04X:0x%02X:0x%02X,0x%04X)", repo.rcvDataSize,
+                                               ntohs(lHdr->loadId), lHdr->testAction, lHdr->rxStopped, lHdr->checkSum);
+                        } else {
+                                var += sprintf(&scratch[var], " status PDU (%d,0x%04X:0x%02X:0x%02X,0x%04X)", repo.rcvDataSize,
+                                               ntohs(sHdr->statusId), sHdr->testAction, sHdr->rxStopped, sHdr->checkSum);
+                        }
+                        if (!repo.isServer) {
+                                var += sprintf(&scratch[var], " [Server %s:%d]", repo.server[c->serverIndex].ip,
+                                               repo.server[c->serverIndex].port);
+                        }
+                        scratch[var++] = '\n';
+                        send_proc(errConn, scratch, var);
+                        //
+                        repo.endTimeStatus = STATUS_WARNBASE + WARN_RX_INVPDU; // ErrorStatus
+                }
+                return FALSE;
+        }
+        return TRUE;
 }
 //----------------------------------------------------------------------------

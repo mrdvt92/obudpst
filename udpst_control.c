@@ -61,6 +61,14 @@
  * Len Ciavattone          03/05/2023    Fix server setup error messages
  * Len Ciavattone          03/22/2023    Add GSO and GRO optimizations
  * Len Ciavattone          03/25/2023    GRO replaced w/recvmmsg+truncation
+ * Len Ciavattone          05/24/2023    Add data output (export) capability
+ * Len Ciavattone          10/01/2023    Updated ErrorStatus values
+ * Len Ciavattone          12/18/2023    Add server msg for invalid setup req
+ * Len Ciavattone          02/23/2024    Add status feedback loss to export
+ * Len Ciavattone          03/03/2024    Add multi-key support
+ * Len Ciavattone          04/12/2024    Enhanced control PDU integrity checks
+ * Len Ciavattone          06/24/2024    Add interface Mbps to export
+ * Len Ciavattone          07/02/2024    Preset dir for bw dealloc on timeout
  *
  */
 
@@ -73,6 +81,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
+#include <time.h>
 #include <netdb.h>
 #include <net/if.h>
 #include <arpa/inet.h>
@@ -105,6 +114,9 @@ int service_actreq(int);
 int service_actresp(int);
 int sock_connect(int);
 int connected(int);
+int open_outputfile(int);
+BOOL validate_auth(void);
+BOOL verify_ctrlpdu(int, struct controlHdrSR *, struct controlHdrTA *, char *, char *);
 
 //----------------------------------------------------------------------------
 //
@@ -131,7 +143,7 @@ extern cJSON *json_top, *json_output;
 #define RAND_TEXT   "random"
 #define TESTHDR_LINE1 \
         "%s%s Test Int(sec): %d, DelayVar Thresh(ms): %d-%d [%s], Trial Int(ms): %d, Ignore OoO/Dup: %s, Payload: %s,\n"
-#define TESTHDR_LINE2 "    SendRate Index: %s, Cong. Thresh: %d, High-Speed Delta: %d, SeqError Thresh: %d, Algo: %s, Conn: %d, "
+#define TESTHDR_LINE2 "  ID: %d, SR Index: %s, Cong. Thresh: %d, HS Delta: %d, SeqErr Thresh: %d, Algo: %s, Conn: %d, "
 static char *testHdrV4 = TESTHDR_LINE1 TESTHDR_LINE2 "IPv4 ToS: %d%s\n";
 static char *testHdrV6 = TESTHDR_LINE1 TESTHDR_LINE2 "IPv6 TClass: %d%s\n";
 
@@ -164,6 +176,8 @@ void init_conn(int connindex, BOOL cleanup) {
 #endif
                         close(c->fd);
                 }
+                if (c->outputFPtr != NULL)
+                        fclose(c->outputFPtr);
         }
 
         //
@@ -205,6 +219,7 @@ int send_setupreq(int connindex, int mcIndex, int serverIndex) {
         char addrstr[INET6_ADDR_STRLEN], portstr[8], intfpath[IFNAMSIZ + 64];
         struct controlHdrSR *cHdrSR = (struct controlHdrSR *) repo.defBuffer;
 #ifdef AUTH_KEY_ENABLE
+        char *key;
         unsigned int uvar;
 #endif
         //
@@ -276,17 +291,26 @@ int send_setupreq(int connindex, int mcIndex, int serverIndex) {
         if (conf.traditionalMTU) {
                 cHdrSR->modifierBitmap |= CHSR_TRADITIONAL_MTU;
         }
-        if (*conf.authKey == '\0') {
+        if (*conf.authKey == '\0' && conf.keyFile == NULL) {
                 cHdrSR->authMode     = AUTHMODE_NONE;
                 cHdrSR->authUnixTime = 0;
+                cHdrSR->keyId        = 0;
 #ifdef AUTH_KEY_ENABLE
         } else {
                 cHdrSR->authMode     = AUTHMODE_SHA256;
                 cHdrSR->authUnixTime = htonl((uint32_t) repo.systemClock.tv_sec);
-                HMAC(EVP_sha256(), conf.authKey, strlen(conf.authKey), (const unsigned char *) cHdrSR, CHSR_SIZE_CVER,
-                     cHdrSR->authDigest, &uvar);
+                cHdrSR->keyId        = (uint8_t) conf.keyId;
+                if (*conf.authKey != '\0') {
+                        key = conf.authKey;
+                } else {
+                        key = repo.key[repo.keyIndex].key;
+                }
+                HMAC(EVP_sha256(), key, strlen(key), (const unsigned char *) cHdrSR, CHSR_SIZE_CVER, cHdrSR->authDigest, &uvar);
 #endif
         }
+#ifdef ADD_HEADER_CSUM
+        cHdrSR->checkSum = checksum(cHdrSR, CHSR_SIZE_CVER); // Added after HMAC (server MUST clear before HMAC validation)
+#endif
 
         //
         // Update global address info for subsequent send
@@ -338,9 +362,10 @@ int timeout_testinit(int connindex) {
         //
         // Notify user and set immediate end time
         //
-        var = sprintf(scratch, "ERROR: Timeout awaiting response from server %s:%d\n", repo.server[c->serverIndex].ip,
+        var = sprintf(scratch, "WARNING: Timeout awaiting response from server %s:%d\n", repo.server[c->serverIndex].ip,
                       repo.server[c->serverIndex].port);
         send_proc(errConn, scratch, var);
+        repo.endTimeStatus = STATUS_WARNBASE + WARN_SRV_TIMEOUT; // ErrorStatus
         tspeccpy(&c->endTime, &repo.systemClock);
 
         return 0;
@@ -353,42 +378,30 @@ int timeout_testinit(int connindex) {
 //
 int service_setupreq(int connindex) {
         register struct connection *c = &conn[connindex];
-        int i, var, pver, mbw = 0, currbw = repo.dsBandwidth, anchor = 0;
+        int i = -1, var, pver, mbw = 0, currbw = repo.dsBandwidth;
         BOOL usbw = FALSE;
         struct timespec tspecvar;
         char addrstr[INET6_ADDR_STRLEN], portstr[8];
         struct controlHdrSR *cHdrSR = (struct controlHdrSR *) repo.defBuffer;
-#ifdef AUTH_KEY_ENABLE
-        unsigned int uvar;
-        unsigned char digest1[AUTH_DIGEST_LENGTH], digest2[AUTH_DIGEST_LENGTH];
-#endif
+
         //
         // Verify PDU
         //
-        if (repo.rcvDataSize < (int) CHSR_SIZE_MVER || repo.rcvDataSize > (int) CHSR_SIZE_CVER ||
-            ntohs(cHdrSR->controlId) != CHSR_ID) {
+        getnameinfo((struct sockaddr *) &repo.remSas, repo.remSasLen, addrstr, INET6_ADDR_STRLEN, portstr, sizeof(portstr),
+                    NI_NUMERICHOST | NI_NUMERICSERV);
+        if (!verify_ctrlpdu(connindex, cHdrSR, NULL, addrstr, portstr)) {
                 return 0; // Ignore bad PDU
-        }
-        if (cHdrSR->cmdRequest != CHSR_CREQ_SETUPREQ) {
-                return 0;
-        }
-        if (cHdrSR->cmdResponse != CHSR_CRSP_NONE) {
-                return 0;
         }
 
         //
         // Check specifics of setup request from client
         //
-        var = 0;
-        getnameinfo((struct sockaddr *) &repo.remSas, repo.remSasLen, addrstr, INET6_ADDR_STRLEN, portstr, sizeof(portstr),
-                    NI_NUMERICHOST | NI_NUMERICSERV);
+        var  = 0; // Used for error indication throughout next section
         pver = (int) ntohs(cHdrSR->protocolVer);
-        if (pver >= BWMGMT_PVER) {
-                mbw = (int) (ntohs(cHdrSR->maxBandwidth) & ~CHSR_USDIR_BIT); // Obtain max bandwidth while ignoring upstream bit
-                if (ntohs(cHdrSR->maxBandwidth) & CHSR_USDIR_BIT) {
-                        usbw   = TRUE; // Max bandwidth is for upstream
-                        currbw = repo.usBandwidth;
-                }
+        mbw  = (int) (ntohs(cHdrSR->maxBandwidth) & ~CHSR_USDIR_BIT); // Obtain max bandwidth while ignoring upstream bit
+        if (ntohs(cHdrSR->maxBandwidth) & CHSR_USDIR_BIT) {
+                usbw   = TRUE; // Max bandwidth is for upstream
+                currbw = repo.usBandwidth;
         }
         if (pver < PROTOCOL_MIN || pver > PROTOCOL_VER) {
                 var                 = sprintf(scratch, "ERROR: Invalid version (%d) in setup request from", pver);
@@ -401,7 +414,7 @@ int service_setupreq(int connindex) {
                 cHdrSR->cmdResponse = CHSR_CRSP_MCINVPAR;
 
         } else if (((cHdrSR->modifierBitmap & CHSR_JUMBO_STATUS) && !conf.jumboStatus) ||
-                   !(cHdrSR->modifierBitmap & CHSR_JUMBO_STATUS) && conf.jumboStatus) {
+                   (!(cHdrSR->modifierBitmap & CHSR_JUMBO_STATUS) && conf.jumboStatus)) {
                 var                 = sprintf(scratch, "ERROR: Invalid jumbo datagram option in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_BADJS;
 
@@ -410,36 +423,35 @@ int service_setupreq(int connindex) {
                 var                 = sprintf(scratch, "ERROR: Invalid traditional MTU option in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_BADTMTU;
 
-        } else if (pver >= BWMGMT_PVER && conf.maxBandwidth > 0 && mbw == 0) {
+        } else if (conf.maxBandwidth > 0 && mbw == 0) {
                 var                 = sprintf(scratch, "ERROR: Required bandwidth not specified in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_NOMAXBW;
 
-        } else if (pver >= BWMGMT_PVER && conf.maxBandwidth > 0 && currbw + mbw > conf.maxBandwidth) {
+        } else if (conf.maxBandwidth > 0 && currbw + mbw > conf.maxBandwidth) {
                 var = sprintf(scratch, "ERROR: Capacity exceeded (%d.%d) by required bandwidth (%d) in setup request from",
                               cHdrSR->mcIndex, (int) ntohs(cHdrSR->mcIdent), mbw);
                 cHdrSR->cmdResponse = CHSR_CRSP_CAPEXC;
 
-        } else if (cHdrSR->authMode != AUTHMODE_NONE && *conf.authKey == '\0') {
+        } else if (cHdrSR->authMode != AUTHMODE_NONE && *conf.authKey == '\0' && conf.keyFile == NULL) {
                 var                 = sprintf(scratch, "ERROR: Unexpected authentication in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_AUTHNC;
 #ifdef AUTH_KEY_ENABLE
-        } else if (cHdrSR->authMode == AUTHMODE_NONE && *conf.authKey != '\0') {
+#ifndef AUTH_IS_OPTIONAL
+        } else if (cHdrSR->authMode == AUTHMODE_NONE && (*conf.authKey != '\0' || conf.keyFile != NULL)) {
                 var                 = sprintf(scratch, "ERROR: Authentication missing in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_AUTHREQ;
-
-        } else if (cHdrSR->authMode != AUTHMODE_SHA256 && *conf.authKey != '\0') {
+#endif // AUTH_IS_OPTIONAL
+        } else if (cHdrSR->authMode != AUTHMODE_NONE && cHdrSR->authMode != AUTHMODE_SHA256) {
                 var                 = sprintf(scratch, "ERROR: Invalid authentication method in setup request from");
                 cHdrSR->cmdResponse = CHSR_CRSP_AUTHINV;
 
-        } else if (cHdrSR->authMode == AUTHMODE_SHA256 && *conf.authKey != '\0') {
+        } else if (cHdrSR->authMode == AUTHMODE_SHA256 && (*conf.authKey != '\0' || conf.keyFile != NULL)) {
                 //
                 // Validate authentication digest (leave zeroed for response) and check time window if enforced
                 //
-                memcpy(digest1, cHdrSR->authDigest, AUTH_DIGEST_LENGTH);
-                memset(cHdrSR->authDigest, 0, AUTH_DIGEST_LENGTH);
-                HMAC(EVP_sha256(), conf.authKey, strlen(conf.authKey), (const unsigned char *) cHdrSR, CHSR_SIZE_CVER, digest2,
-                     &uvar);
-                if (memcmp(digest1, digest2, AUTH_DIGEST_LENGTH)) {
+                if (pver >= CHECKSUM_PVER)
+                        cHdrSR->checkSum = 0; // MUST be cleared before HMAC validation
+                if (validate_auth()) {
                         var                 = sprintf(scratch, "ERROR: Authentication failure of setup request from");
                         cHdrSR->cmdResponse = CHSR_CRSP_AUTHFAIL;
 
@@ -451,12 +463,18 @@ int service_setupreq(int connindex) {
                                 cHdrSR->cmdResponse = CHSR_CRSP_AUTHTIME;
                         }
                 }
-#endif
+#endif // AUTH_KEY_ENABLE
         }
         if (cHdrSR->cmdResponse == CHSR_CRSP_NONE) {
                 if (conf.verbose) {
-                        var = sprintf(scratch, "[%d]Setup request (%d.%d, Ver: %d, MaxBW: %d) received from %s:%s\n", connindex,
-                                      (int) cHdrSR->mcIndex, (int) ntohs(cHdrSR->mcIdent), pver, mbw, addrstr, portstr);
+                        if (pver < MULTIKEY_PVER) {
+                                var = DEF_KEY_ID; // Use default key ID for older protocol versions
+                        } else {
+                                var = (int) cHdrSR->keyId; // Else obtain key ID specified by client
+                        }
+                        var = sprintf(scratch, "[%d]Setup request (%d.%d, Ver: %d, MaxBW: %d, KeyID: %d) received from %s:%s\n",
+                                      connindex, (int) cHdrSR->mcIndex, (int) ntohs(cHdrSR->mcIdent), pver, mbw, var, addrstr,
+                                      portstr);
                         send_proc(monConn, scratch, var);
                 }
                 //
@@ -476,7 +494,13 @@ int service_setupreq(int connindex) {
                         var += sprintf(&scratch[var], " %s:%s\n", addrstr, portstr);
                         send_proc(errConn, scratch, var);
                 }
-                send_proc(connindex, (char *) cHdrSR, CHSR_SIZE_CVER);
+                if (pver >= CHECKSUM_PVER) {
+                        cHdrSR->checkSum = 0;
+#ifdef ADD_HEADER_CSUM
+                        cHdrSR->checkSum = checksum(cHdrSR, repo.rcvDataSize);
+#endif
+                }
+                send_proc(connindex, (char *) cHdrSR, repo.rcvDataSize);
                 return 0;
         }
 
@@ -489,10 +513,13 @@ int service_setupreq(int connindex) {
         conn[i].mcIdent     = (int) ntohs(cHdrSR->mcIdent);
         if (conf.maxBandwidth > 0) {
                 conn[i].maxBandwidth = mbw; // Save bandwidth for adjustment at end of test
-                if (usbw)
-                        repo.usBandwidth += mbw; // Update current upstream bandwidth
-                else
-                        repo.dsBandwidth += mbw; // Update current downstream bandwidth
+                if (usbw) {
+                        conn[i].testType = TEST_TYPE_US; // Preset direction to allow for bandwidth deallocation on timeout
+                        repo.usBandwidth += mbw;         // Update current upstream bandwidth
+                } else {
+                        conn[i].testType = TEST_TYPE_DS; // Preset direction to allow for bandwidth deallocation on timeout
+                        repo.dsBandwidth += mbw;         // Update current downstream bandwidth
+                }
                 if (conf.verbose && mbw > 0) {
                         var = sprintf(scratch, "[%d]Bandwidth of %d allocated (New USBW: %d, DSBW: %d)\n", i, mbw, repo.usBandwidth,
                                       repo.dsBandwidth);
@@ -512,7 +539,13 @@ int service_setupreq(int connindex) {
         //
         cHdrSR->cmdResponse = CHSR_CRSP_ACKOK;
         cHdrSR->testPort    = htons((uint16_t) conn[i].locPort);
-        var                 = CHSR_SIZE_CVER;
+        if (pver >= CHECKSUM_PVER) {
+                cHdrSR->checkSum = 0;
+#ifdef ADD_HEADER_CSUM
+                cHdrSR->checkSum = checksum(cHdrSR, repo.rcvDataSize);
+#endif
+        }
+        var = repo.rcvDataSize;
         if (send_proc(connindex, (char *) cHdrSR, var) != var)
                 return 0;
         if (conf.verbose) {
@@ -530,7 +563,7 @@ int service_setupreq(int connindex) {
 //
 int service_setupresp(int connindex) {
         register struct connection *c = &conn[connindex];
-        int i, j, var;
+        int var;
         char addrstr[INET6_ADDR_STRLEN], portstr[8];
         struct controlHdrSR *cHdrSR = (struct controlHdrSR *) repo.defBuffer;
         struct controlHdrTA *cHdrTA = (struct controlHdrTA *) repo.defBuffer;
@@ -538,21 +571,19 @@ int service_setupresp(int connindex) {
         //
         // Verify PDU
         //
-        if (repo.rcvDataSize < (int) CHSR_SIZE_CVER || ntohs(cHdrSR->controlId) != CHSR_ID) {
+        if (!verify_ctrlpdu(connindex, cHdrSR, NULL, NULL, NULL)) {
                 return 0; // Ignore bad PDU
-        }
-        if (cHdrSR->cmdRequest != CHSR_CREQ_SETUPRSP) {
-                return 0;
         }
 
         //
         // Process any setup response errors
         //
         if (cHdrSR->cmdResponse != CHSR_CRSP_ACKOK) {
-                var = 0;
+                var                = 0;
+                repo.endTimeStatus = CHSR_CRSP_ERRBASE + cHdrSR->cmdResponse; // ErrorStatus
                 switch (cHdrSR->cmdResponse) {
                 case CHSR_CRSP_BADVER:
-                        var = sprintf(scratch, "ERROR: Client version not accepted (%u vs. %u) by server", PROTOCOL_VER,
+                        var = sprintf(scratch, "ERROR: Client protocol version (%u) not accepted by server (%u)", PROTOCOL_VER,
                                       ntohs(cHdrSR->protocolVer));
                         break;
                 case CHSR_CRSP_BADJS:
@@ -589,6 +620,7 @@ int service_setupresp(int connindex) {
                         var = sprintf(scratch, "ERROR: Connection allocation failure on server");
                         break;
                 default:
+                        repo.endTimeStatus = CHSR_CRSP_ERRBASE; // Unexpected values use only error base for ErrorStatus
                         var = sprintf(scratch, "ERROR: Unexpected CRSP (%u) in setup response from server", cHdrSR->cmdResponse);
                 }
                 if (var > 0) {
@@ -678,7 +710,10 @@ int service_setupresp(int connindex) {
         // Send test activation request
         //
         c->secAction = &service_actresp; // Set service handler for response
-        var          = CHTA_SIZE_CVER;
+#ifdef ADD_HEADER_CSUM
+        cHdrTA->checkSum = checksum(cHdrTA, CHTA_SIZE_CVER);
+#endif
+        var = CHTA_SIZE_CVER;
         if (send_proc(connindex, (char *) cHdrTA, var) != var)
                 return 0;
         if (conf.verbose) {
@@ -698,8 +733,7 @@ int service_setupresp(int connindex) {
 int service_actreq(int connindex) {
         register struct connection *c = &conn[connindex];
         int var;
-        char *testhdr, *testtype, connid[8], delusage[8], sritext[8], payload[8];
-        char addrstr[INET6_ADDR_STRLEN], portstr[8], intflabel[IFNAMSIZ + 8];
+        char addrstr[INET6_ADDR_STRLEN], portstr[8];
         struct sendingRate *sr = repo.sendingRates; // Set to first row of table
         struct timespec tspecvar;
         struct controlHdrTA *cHdrTA = (struct controlHdrTA *) repo.defBuffer;
@@ -707,32 +741,20 @@ int service_actreq(int connindex) {
         //
         // Verify PDU
         //
-        var = (int) ntohs(cHdrTA->protocolVer);
-        if (repo.rcvDataSize < (int) CHTA_SIZE_MVER || repo.rcvDataSize > (int) CHTA_SIZE_CVER ||
-            ntohs(cHdrTA->controlId) != CHTA_ID || var < PROTOCOL_MIN || var > PROTOCOL_VER) {
-                return 0; // Ignore bad PDU
-        }
-        if ((cHdrTA->cmdRequest != CHTA_CREQ_TESTACTUS) && (cHdrTA->cmdRequest != CHTA_CREQ_TESTACTDS)) {
-                return 0;
-        }
-        if (cHdrTA->cmdResponse != CHTA_CRSP_NONE) {
-                return 0;
-        }
-
-        //
-        // Obtain IP address and port number of sender
-        //
         getnameinfo((struct sockaddr *) &repo.remSas, repo.remSasLen, addrstr, INET6_ADDR_STRLEN, portstr, sizeof(portstr),
                     NI_NUMERICHOST | NI_NUMERICSERV);
-        if (conf.verbose) {
-                var = sprintf(scratch, "[%d]Test activation request (%d.%d) received from %s:%s\n", connindex, c->mcIndex,
-                              c->mcIdent, addrstr, portstr);
-                send_proc(monConn, scratch, var);
+        if (!verify_ctrlpdu(connindex, NULL, cHdrTA, addrstr, portstr)) {
+                return 0; // Ignore bad PDU
         }
 
         //
         // Update global address info with client address/port number and connect socket
         //
+        if (conf.verbose) {
+                var = sprintf(scratch, "[%d]Test activation request (%d.%d) received from %s:%s\n", connindex, c->mcIndex,
+                              c->mcIdent, addrstr, portstr);
+                send_proc(monConn, scratch, var);
+        }
         var = atoi(portstr);
         if ((var = sock_mgmt(connindex, addrstr, var, NULL, SMA_UPDATE)) != 0) {
                 send_proc(errConn, scratch, var);
@@ -741,7 +763,7 @@ int service_actreq(int connindex) {
         if (sock_connect(connindex) < 0)
                 return 0;
 
-        //====================================================================================
+        // ===================================================================
         // Accept (but police) most test parameters as is and enforce server configured
         // maximums where applicable. Update modified values for communication back to client.
         // If the request needs to be rejected use command response value CHTA_CRSP_BADPARAM.
@@ -895,19 +917,18 @@ int service_actreq(int connindex) {
                 cHdrTA->rateAdjAlgo = (uint8_t) c->rateAdjAlgo;
         }
         //
-        // If upstream test, send back sending rate parameters from first row of table
+        // If upstream test, send back initial sending rate transmission parameters
         //
         if (cHdrTA->cmdRequest == CHTA_CREQ_TESTACTUS) {
                 sr_copy(sr, &cHdrTA->srStruct, TRUE);
         } else {
                 memset(&cHdrTA->srStruct, 0, sizeof(struct sendingRate));
         }
-        //====================================================================================
+        // ===================================================================
 
         //
         // Continue updating connection if test activation is NOT being rejected
         //
-        testtype = NULL;
         if (cHdrTA->cmdResponse == CHTA_CRSP_ACKOK) {
                 //
                 // Set connection test action as testing and initialize PDU received time
@@ -924,7 +945,6 @@ int service_actreq(int connindex) {
                         // Setup to receive load PDUs and send status PDUs
                         //
                         c->testType   = TEST_TYPE_US;
-                        testtype      = USTEST_TEXT;
                         c->rttMinimum = INITIAL_MIN_DELAY;
                         c->rttSample  = INITIAL_MIN_DELAY;
 #ifdef HAVE_RECVMMSG
@@ -945,7 +965,6 @@ int service_actreq(int connindex) {
                         // Setup to receive status PDUs and send load PDUs
                         //
                         c->testType  = TEST_TYPE_DS;
-                        testtype     = DSTEST_TEXT;
                         c->secAction = &service_statuspdu;
                         //
                         if (sr->txInterval1 > 0) {
@@ -968,7 +987,13 @@ int service_actreq(int connindex) {
         //
         // Send test activation response to client
         //
-        var = CHTA_SIZE_CVER;
+        if (c->protocolVer >= CHECKSUM_PVER) {
+                cHdrTA->checkSum = 0;
+#ifdef ADD_HEADER_CSUM
+                cHdrTA->checkSum = checksum(cHdrTA, repo.rcvDataSize);
+#endif
+        }
+        var = repo.rcvDataSize;
         if (send_proc(connindex, (char *) cHdrTA, var) != var)
                 return 0;
         if (conf.verbose) {
@@ -983,6 +1008,15 @@ int service_actreq(int connindex) {
         if (cHdrTA->cmdResponse != CHTA_CRSP_ACKOK) {
                 tspeccpy(&c->endTime, &repo.systemClock); // Set for immediate close/exit
                 return 0;
+        }
+
+        //
+        // Open output file if specified for upstream tests
+        //
+        if (conf.outputFile != NULL && cHdrTA->cmdRequest == CHTA_CREQ_TESTACTUS) {
+                if ((var = open_outputfile(connindex)) > 0) {
+                        send_proc(errConn, scratch, var); // Output error message
+                }
         }
 
         //
@@ -1021,21 +1055,20 @@ int service_actresp(int connindex) {
         //
         // Verify PDU
         //
-        if (repo.rcvDataSize < (int) CHTA_SIZE_CVER || ntohs(cHdrTA->controlId) != CHTA_ID) {
+        if (!verify_ctrlpdu(connindex, NULL, cHdrTA, NULL, NULL)) {
                 return 0; // Ignore bad PDU
-        }
-        if ((cHdrTA->cmdRequest != CHTA_CREQ_TESTACTUS) && (cHdrTA->cmdRequest != CHTA_CREQ_TESTACTDS)) {
-                return 0;
         }
 
         //
         // Process any test activation response errors
         //
         if (cHdrTA->cmdResponse != CHTA_CRSP_ACKOK) {
+                repo.endTimeStatus = CHTA_CRSP_ERRBASE + cHdrTA->cmdResponse; // ErrorStatus
                 if (cHdrTA->cmdResponse == CHTA_CRSP_BADPARAM) {
                         var = sprintf(scratch, "ERROR: Requested test parameter(s) rejected by server %s:%d\n",
                                       repo.server[c->serverIndex].ip, repo.server[c->serverIndex].port);
                 } else {
+                        repo.endTimeStatus = CHTA_CRSP_ERRBASE; // Unexpected values use only error base for ErrorStatus
                         var = sprintf(scratch, "ERROR: Unexpected CRSP (%u) in test activation response from server %s:%d\n",
                                       cHdrTA->cmdResponse, repo.server[c->serverIndex].ip, repo.server[c->serverIndex].port);
                 }
@@ -1173,8 +1206,9 @@ int service_actresp(int connindex) {
                 }
                 if (!conf.jsonOutput) {
                         var = sprintf(scratch, testhdr, connid, testtype, c->testIntTime, c->lowThresh, c->upperThresh, delusage,
-                                      c->trialInt, boolText[c->ignoreOooDup], payload, sritext, c->slowAdjThresh, c->highSpeedDelta,
-                                      c->seqErrThresh, rateAdjAlgo[c->rateAdjAlgo], c->mcCount, c->ipTosByte, intflabel);
+                                      c->trialInt, boolText[c->ignoreOooDup], payload, c->mcIdent, sritext, c->slowAdjThresh,
+                                      c->highSpeedDelta, c->seqErrThresh, rateAdjAlgo[c->rateAdjAlgo], c->mcCount, c->ipTosByte,
+                                      intflabel);
                         send_proc(errConn, scratch, var);
                 } else {
                         if (!conf.jsonBrief) {
@@ -1191,6 +1225,7 @@ int service_actresp(int connindex) {
                                 } else {
                                         cJSON_AddStringToObject(json_input, "Role", "Receiver");
                                 }
+                                cJSON_AddNumberToObject(json_input, "ID", c->mcIdent);
                                 cJSON_AddStringToObject(json_input, "Host", repo.server[0].name);
                                 cJSON_AddStringToObject(json_input, "HostIPAddress", repo.server[0].ip);
                                 cJSON_AddNumberToObject(json_input, "Port", c->remPort);
@@ -1294,6 +1329,15 @@ int service_actresp(int connindex) {
                         cJSON_AddNumberToObject(json_output, "TestInterval", c->testIntTime);
                         cJSON_AddNumberToObject(json_output, "TmaxRTTUsed", TIMEOUT_NOTRAFFIC * MSECINSEC);
                         cJSON_AddNumberToObject(json_output, "TimestampResolutionUsed", 1);
+                }
+        }
+
+        //
+        // Open output file if specified for downstream test
+        //
+        if (conf.outputFile != NULL && cHdrTA->cmdRequest == CHTA_CREQ_TESTACTDS) {
+                if ((var = open_outputfile(connindex)) > 0) {
+                        send_proc(errConn, scratch, var); // Output error message
                 }
         }
 
@@ -1706,5 +1750,272 @@ int connected(int connindex) {
                 c->ipProtocol = IPPROTO_IP;
         }
         return 0;
+}
+//----------------------------------------------------------------------------
+//
+// Open output (export) data file
+//
+int open_outputfile(int connindex) {
+        register struct connection *c = &conn[connindex];
+        int var;
+        char *lbuffer, *chr, fname[STRING_SIZE];
+
+        if (*conf.outputFile == '\0') {
+                return sprintf(scratch, "ERROR: Output file not defined\n");
+        }
+
+        //
+        // Replace special conversion specification options (#i,#c,...)
+        //
+        var     = 0;
+        lbuffer = conf.outputFile;
+        while (*lbuffer) {
+                if (*lbuffer == '#') {
+                        chr = lbuffer + 1;
+                        if (*chr == 'i') { // Multi-Connection index
+                                var += sprintf(&scratch[var], "%d", c->mcIndex);
+                                lbuffer++;
+                        } else if (*chr == 'c') { // Multi-Connection count
+                                var += sprintf(&scratch[var], "%d", c->mcCount);
+                                lbuffer++;
+                        } else if (*chr == 'I') { // Multi-Connection identifier
+                                var += sprintf(&scratch[var], "%d", c->mcIdent);
+                                lbuffer++;
+                        } else if (*chr == 'l') { // Local IP
+                                var += sprintf(&scratch[var], "%s", c->locAddr);
+                                lbuffer++;
+                        } else if (*chr == 'r') { // Remote IP
+                                var += sprintf(&scratch[var], "%s", c->remAddr);
+                                lbuffer++;
+                        } else if (*chr == 's') { // Source port
+                                var += sprintf(&scratch[var], "%d", c->remPort);
+                                lbuffer++;
+                        } else if (*chr == 'd') { // Destination port
+                                var += sprintf(&scratch[var], "%d", c->locPort);
+                                lbuffer++;
+                        } else if (*chr == 'M') { // Mode
+                                if (repo.isServer)
+                                        scratch[var++] = 'S'; // Server
+                                else
+                                        scratch[var++] = 'C'; // Client
+                                lbuffer++;
+                        } else if (*chr == 'D') { // Direction
+                                if (repo.isServer)
+                                        scratch[var++] = 'U'; // Upstream
+                                else
+                                        scratch[var++] = 'D'; // Downstream
+                                lbuffer++;
+                        } else if (*chr == 'H') { // Host name (or IP) specified for server
+                                if (repo.isServer) {
+                                        if (repo.server[0].name == NULL)
+                                                var += sprintf(&scratch[var], "%s", "InAddrAny");
+                                        else
+                                                var += sprintf(&scratch[var], "%s", repo.server[0].name);
+                                } else {
+                                        var += sprintf(&scratch[var], "%s", repo.server[c->serverIndex].name);
+                                }
+                                lbuffer++;
+                        } else if (*chr == 'p') { // Control port
+                                if (repo.isServer)
+                                        var += sprintf(&scratch[var], "%d", repo.server[0].port);
+                                else
+                                        var += sprintf(&scratch[var], "%d", repo.server[c->serverIndex].port);
+                                lbuffer++;
+                        } else if (*chr == 'E') { // Interface name
+                                var += sprintf(&scratch[var], "%s", conf.intfName);
+                                lbuffer++;
+                        } else {
+                                scratch[var++] = *lbuffer; // Copy character if conversion option not found
+                        }
+                } else {
+                        scratch[var++] = *lbuffer; // Copy non-conversion character
+                }
+                lbuffer++;
+        }
+        scratch[var] = '\0';
+
+        //
+        // Replace date/time conversion specifications with current values
+        //
+        if (strftime(fname, sizeof(fname), scratch, localtime(&repo.systemClock.tv_sec)) == 0) {
+                return sprintf(scratch, "ERROR: Output file name length exceeds maximum\n");
+        }
+
+        //
+        // Open output file
+        //
+        if ((c->outputFPtr = fopen(fname, "w")) == NULL) {
+                return sprintf(scratch, "FOPEN ERROR: <%.*s> %s\n", NAME_MAX, fname, strerror(errno));
+        }
+
+        //
+        // Initialize with header
+        //
+        fputs("SeqNo,PayLoad,SrcTxTime,DstRxTime,OWD,IntfMbps,RTTTxTime,RTTRxTime,RTTRespDelay,RTT,StatusLoss\n", c->outputFPtr);
+
+        return 0;
+}
+//----------------------------------------------------------------------------
+//
+// Validate authentication of client request
+//
+BOOL validate_auth() {
+        BOOL authfail = TRUE;
+#ifdef AUTH_KEY_ENABLE
+        int i, var, pver;
+        char *key;
+        unsigned int uvar;
+        struct controlHdrSR *cHdrSR = (struct controlHdrSR *) repo.defBuffer;
+        unsigned char digest1[AUTH_DIGEST_LENGTH], digest2[AUTH_DIGEST_LENGTH];
+
+        //
+        // Save off received digest and zero it in header
+        //
+        memcpy(digest1, cHdrSR->authDigest, AUTH_DIGEST_LENGTH);
+        memset(cHdrSR->authDigest, 0, AUTH_DIGEST_LENGTH);
+
+        //
+        // Attempt initial validation via key file entry if available
+        //
+        key = NULL;
+        if (conf.keyFile != NULL) {
+                pver = (int) ntohs(cHdrSR->protocolVer);
+                if (pver < MULTIKEY_PVER) {
+                        var = DEF_KEY_ID; // Use default key ID for older protocol versions
+                } else {
+                        var = (int) cHdrSR->keyId; // Else obtain key ID specified by client
+                }
+                for (i = 0; i < repo.keyCount; i++) {
+                        if (repo.key[i].id == var) { // Find key with matching key ID
+                                key = repo.key[i].key;
+                                break;
+                        }
+                }
+        }
+        if (key != NULL) {
+                HMAC(EVP_sha256(), key, strlen(key), (const unsigned char *) cHdrSR, repo.rcvDataSize, digest2, &uvar);
+                if (memcmp(digest1, digest2, AUTH_DIGEST_LENGTH) == 0)
+                        authfail = FALSE;
+        }
+
+        //
+        // Attempt backup validation via command-line key if key file entry was unavailable or unsuccessful
+        //
+        if (authfail == TRUE && *conf.authKey != '\0') {
+                key = conf.authKey;
+                HMAC(EVP_sha256(), key, strlen(key), (const unsigned char *) cHdrSR, repo.rcvDataSize, digest2, &uvar);
+                if (memcmp(digest1, digest2, AUTH_DIGEST_LENGTH) == 0)
+                        authfail = FALSE;
+        }
+#endif
+        return authfail;
+}
+//----------------------------------------------------------------------------
+//
+// Verify control PDU integrity
+//
+BOOL verify_ctrlpdu(int connindex, struct controlHdrSR *cHdrSR, struct controlHdrTA *cHdrTA, char *addrstr, char *portstr) {
+        register struct connection *c = &conn[connindex];
+        BOOL bvar;
+        int var, pver, minsize, maxsize;
+        static int alertCount = 0; // Static
+
+        //
+        // Initialize based on role and PDU type
+        //
+        if (repo.isServer) {
+                if (cHdrSR) {
+                        // Setup request/response
+                        minsize = CHSR_SIZE_MVER;
+                        maxsize = CHSR_SIZE_CVER;
+                        pver    = (int) ntohs(cHdrSR->protocolVer);
+                } else {
+                        // Test activation request/response
+                        minsize = CHTA_SIZE_MVER;
+                        maxsize = CHTA_SIZE_CVER;
+                        pver    = c->protocolVer;
+                }
+        } else {
+                if (cHdrSR) {
+                        // Setup request/response
+                        minsize = maxsize = CHSR_SIZE_CVER;
+                } else {
+                        // Test activation request/response
+                        minsize = maxsize = CHTA_SIZE_CVER;
+                }
+                pver = c->protocolVer;
+        }
+
+        //
+        // Perform PDU verification
+        //
+        bvar = FALSE;
+        if (cHdrSR) {
+                if (repo.rcvDataSize < minsize || repo.rcvDataSize > maxsize) {
+                        bvar = TRUE;
+                } else if (ntohs(cHdrSR->controlId) != CHSR_ID) {
+                        bvar = TRUE;
+                } else if (cHdrSR->cmdRequest != CHSR_CREQ_SETUPREQ && cHdrSR->cmdRequest != CHSR_CREQ_SETUPRSP) {
+                        bvar = TRUE;
+                } else if (pver >= CHECKSUM_PVER && cHdrSR->checkSum != 0) {
+                        if (checksum(cHdrSR, repo.rcvDataSize))
+                                bvar = TRUE;
+                }
+        } else {
+                if (repo.rcvDataSize < minsize || repo.rcvDataSize > maxsize) {
+                        bvar = TRUE;
+                } else if (ntohs(cHdrTA->controlId) != CHTA_ID) {
+                        bvar = TRUE;
+                } else if (cHdrTA->cmdRequest != CHTA_CREQ_TESTACTUS && cHdrTA->cmdRequest != CHTA_CREQ_TESTACTDS) {
+                        bvar = TRUE;
+                } else if (pver >= CHECKSUM_PVER && cHdrTA->checkSum != 0) {
+                        if (checksum(cHdrTA, repo.rcvDataSize))
+                                bvar = TRUE;
+                }
+        }
+
+        //
+        // Process verification failure and generate alert if not suppressed
+        //
+        if (bvar) {
+#ifdef SUPP_INVPDU_ALERT
+                bvar = FALSE; // Flip boolean to suppress output
+#endif
+                if (bvar && alertCount < ALERT_MSG_LIMIT && (!repo.isServer || conf.verbose)) {
+                        if (!repo.isServer && cHdrTA) {
+                                // A lost test activation response for a downstream test will have load PDUs right behind it.
+                                // Excessive alerts are controlled via a local counter and the alert message limit.
+                                alertCount++;
+                        }
+
+                        var = sprintf(scratch, "ALERT: Received invalid");
+                        if (cHdrSR) {
+                                var += sprintf(&scratch[var], " setup");
+                        } else {
+                                var += sprintf(&scratch[var], " test activation");
+                        }
+                        if (repo.isServer) {
+                                var += sprintf(&scratch[var], " request");
+                        } else {
+                                var += sprintf(&scratch[var], " response");
+                        }
+                        if (cHdrSR) {
+                                var += sprintf(&scratch[var], " (%d,0x%04X:0x%04X,0x%04X)", repo.rcvDataSize,
+                                               ntohs(cHdrSR->controlId), ntohs(cHdrSR->protocolVer), cHdrSR->checkSum);
+                        } else {
+                                var += sprintf(&scratch[var], " (%d,0x%04X:0x%04X,0x%04X)", repo.rcvDataSize,
+                                               ntohs(cHdrTA->controlId), ntohs(cHdrTA->protocolVer), cHdrTA->checkSum);
+                        }
+                        if (repo.isServer) {
+                                var += sprintf(&scratch[var], " from %s:%s\n", addrstr, portstr);
+                        } else {
+                                var += sprintf(&scratch[var], " [Server %s:%d]\n", repo.server[c->serverIndex].ip,
+                                               repo.server[c->serverIndex].port);
+                        }
+                        send_proc(errConn, scratch, var);
+                }
+                return FALSE;
+        }
+        return TRUE;
 }
 //----------------------------------------------------------------------------

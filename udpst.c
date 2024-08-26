@@ -64,10 +64,12 @@
  * Len Ciavattone          03/04/2023    Load balance returned epoll events
  * Len Ciavattone          03/22/2023    Add optimization output to banner
  * Len Ciavattone          04/04/2023    Add optional rate limiting to banner
+ * Len Ciavattone          05/24/2023    Add data output (export) capability
+ * Len Ciavattone          10/01/2023    Updated ErrorStatus values
+ * Len Ciavattone          03/03/2024    Add multi-key support
+ * Len Ciavattone          04/12/2024    Add checksum info to banner
  *
  */
-
-#include "config.h"
 
 #define UDPST
 #ifdef __linux__
@@ -113,6 +115,7 @@ void signal_alrm(int);
 void signal_exit(int);
 int proc_parameters(int, char **, int);
 int param_error(int, int, int);
+int read_keyfile(int);
 int json_finish(void);
 
 //----------------------------------------------------------------------------
@@ -121,6 +124,7 @@ int json_finish(void);
 //
 #define ENDTEXT_BASIC "[%d]End time reached"
 #define ENDTEXT_NEWBW ENDTEXT_BASIC " (New USBW: %d, DSBW: %d)\n"
+#define NOAUTH_TEXT   "ERROR: Built without authentication functionality\n"
 int errConn = -1, monConn = -1, aggConn = -1; // Error, monitoring, and aggregate
 char scratch[STRING_SIZE];                    // General purpose scratch buffer
 struct configuration conf;                    // Configuration data structure
@@ -133,7 +137,7 @@ char *boolText[]    = {"Disabled", "Enabled"};
 char *rateAdjAlgo[] = {"B", "C"}; // Aligned to CHTA_RA_ALGO_x
 //
 cJSON *json_top = NULL, *json_output = NULL, *json_siArray = NULL;
-char json_errbuf[STRING_SIZE];
+char json_errbuf[STRING_SIZE], json_errbuf2[STRING_SIZE];
 
 //----------------------------------------------------------------------------
 // Function definitions
@@ -144,7 +148,7 @@ char json_errbuf[STRING_SIZE];
 int main(int argc, char **argv) {
         pid_t pid;
         int i, j, var, var2, readyfds, fdpass, pristatus, secstatus;
-        int appstatus = 0, outputfd = STDOUT_FILENO, logfilefd = -1;
+        int appstatus = STATUS_ERROR, outputfd = STDOUT_FILENO, logfilefd = -1;
         struct itimerval itime;
         struct sigaction saction;
         struct stat statbuf;
@@ -155,21 +159,30 @@ int main(int argc, char **argv) {
         if (sizeof(rateAdjAlgo) / sizeof(char *) != CHTA_RA_ALGO_MAX + 1) {
                 var = sprintf(scratch, "ERROR: Invalid number of rate adjustment algorithm identifiers\n");
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
         for (var = CHTA_RA_ALGO_MIN; var <= CHTA_RA_ALGO_MAX; var++) {
                 if (rateAdjAlgo[var] == NULL) {
                         var = sprintf(scratch, "ERROR: Null pointer for rate adjustment algorithm identifier\n");
                         var = write(outputfd, scratch, var);
-                        return -1;
+                        return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                 }
         }
 
         //
         // Verify and process parameters, initialize configuration and repository
         //
-        if (proc_parameters(argc, argv, outputfd) != 0) {
-                return -1;
+        if ((var = proc_parameters(argc, argv, outputfd)) != -1) {
+                return STATUS_CONF_ERRBASE + var;
+        }
+
+        //
+        // Read and store key entries if key file provided
+        //
+        if (conf.keyFile != NULL) {
+                if ((var = read_keyfile(outputfd)) != -1) {
+                        return STATUS_CONF_ERRBASE + var;
+                }
         }
 
         //
@@ -178,7 +191,8 @@ int main(int argc, char **argv) {
         if (conf.jsonOutput) {
                 json_top = cJSON_CreateObject();
         }
-        *json_errbuf = '\0'; // Initialize to no error
+        *json_errbuf  = '\0'; // Initialize to no error
+        *json_errbuf2 = '\0'; // Initialize to no error
 
         //
         // Execute as daemon if requested
@@ -191,12 +205,12 @@ int main(int argc, char **argv) {
                         if ((logfilefd = open(conf.logFile, LOGFILE_FLAGS, LOGFILE_MODE)) < 0) {
                                 var = snprintf(scratch, STRING_SIZE, "OPEN ERROR: <%s> %s\n", conf.logFile, strerror(errno));
                                 var = write(outputfd, scratch, var);
-                                return -1;
+                                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                         }
                         if (fstat(logfilefd, &statbuf) < 0) {
                                 var = snprintf(scratch, STRING_SIZE, "FSTAT ERROR: <%s> %s\n", conf.logFile, strerror(errno));
                                 var = write(outputfd, scratch, var);
-                                return -1;
+                                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                         }
                         repo.logFileSize = (int) statbuf.st_size; // Initialize log file size
                         outputfd         = logfilefd;
@@ -207,9 +221,9 @@ int main(int argc, char **argv) {
                 if ((pid = fork()) < 0) {
                         var = sprintf(scratch, "ERROR: fork() failed\n");
                         var = write(outputfd, scratch, var);
-                        return -1;
+                        return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                 } else if (pid != 0) {
-                        return 0; // Parent exits
+                        return STATUS_SUCCESS; // Parent exits
                 }
                 //
                 // Initialize child
@@ -264,10 +278,15 @@ int main(int argc, char **argv) {
                 else
                         var = sprintf(scratch, "Mode: Client, Payload Default[Max]: %d[%d]", i, j);
 #ifdef AUTH_KEY_ENABLE
-                var += sprintf(&scratch[var], ", Authentication: Available");
+                var += sprintf(&scratch[var], ", Auth: Available");
 #else
-                var += sprintf(&scratch[var], ", Authentication: Unavailable");
+                var += sprintf(&scratch[var], ", Auth: Unavailable");
 #endif // AUTH_KEY_ENABLE
+#ifdef ADD_HEADER_CSUM
+                var += sprintf(&scratch[var], ", Checksum: On");
+#else
+                var += sprintf(&scratch[var], ", Checksum: Off");
+#endif // ADD_HEADER_CSUM
                 var += sprintf(&scratch[var], ", Optimizations:");
 #ifdef HAVE_SENDMMSG
                 var += sprintf(&scratch[var], " SendMMsg()");
@@ -308,11 +327,11 @@ int main(int argc, char **argv) {
             repo.sndBufRand == NULL || conn == NULL) {
                 var = sprintf(scratch, "ERROR: Memory allocation(s) failed\n");
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
         for (i = 0; i < conf.maxConnections; i++)
                 init_conn(i, FALSE);
-        for (i = 0; i < MAX_JPAYLOAD_SIZE / sizeof(int); i++)
+        for (i = 0; i < (int) (MAX_JPAYLOAD_SIZE / sizeof(int)); i++)
                 ((int *) repo.randData)[i] = random();
 
         //
@@ -320,7 +339,7 @@ int main(int argc, char **argv) {
         //
         if ((var = def_sending_rates()) > 0) {
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
 
         //
@@ -328,7 +347,7 @@ int main(int argc, char **argv) {
         //
         if (conf.showSendingRates) {
                 show_sending_rates(outputfd);
-                return 0;
+                return STATUS_SUCCESS;
         }
 
         //
@@ -338,14 +357,14 @@ int main(int argc, char **argv) {
         if (clock_getres(CLOCK_REALTIME, &repo.systemClock) == -1) {
                 var = sprintf(scratch, "CLOCK_GETRES ERROR: %s\n", strerror(errno));
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
         if (repo.systemClock.tv_nsec > 1) {
                 var =
                     sprintf(scratch, "ERROR: Clock resolution (%ld ns) out of range [see compile-time option DISABLE_INT_TIMER]\n",
                             repo.systemClock.tv_nsec);
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
         clock_gettime(CLOCK_REALTIME, &repo.systemClock); // Reinitialize local copy of system time clock
 #endif
@@ -360,7 +379,7 @@ int main(int argc, char **argv) {
         if (sigaction(SIGALRM, &saction, NULL) != 0) {
                 var = sprintf(scratch, "SIGALRM ERROR: %s\n", strerror(errno));
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
 #endif
 
@@ -373,7 +392,7 @@ int main(int argc, char **argv) {
         if (setitimer(ITIMER_REAL, &itime, NULL) != 0) {
                 var = sprintf(scratch, "ITIMER ERROR: %s\n", strerror(errno));
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
 #endif
 
@@ -391,7 +410,7 @@ int main(int argc, char **argv) {
         if (pristatus != 0) {
                 var = sprintf(scratch, "ERROR: Unable to install exit signal handler\n");
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
 
         //
@@ -400,7 +419,7 @@ int main(int argc, char **argv) {
         if ((repo.epollFD = epoll_create1(0)) < 0) {
                 var = sprintf(scratch, "ERROR: Unable to open epoll file descriptor\n");
                 var = write(outputfd, scratch, var);
-                return -1;
+                return STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
         }
 
         //
@@ -416,8 +435,8 @@ int main(int argc, char **argv) {
         if (pristatus != 0) {
                 var       = sprintf(scratch, "ERROR: Unable to modify standard I/O FDs\n");
                 var       = write(outputfd, scratch, var);
-                appstatus = -1;
-                sig_exit  = 1;
+                appstatus = STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
+                sig_exit  = TRUE;
         }
 
         //
@@ -447,16 +466,30 @@ int main(int argc, char **argv) {
         }
 
         //
+        // Display key file info if needed
+        //
+        if (!sig_exit && conf.verbose && conf.keyFile != NULL) {
+                var = sprintf(scratch, "Authentication keys read from key file: %d\n", repo.keyCount);
+                send_proc(monConn, scratch, var);
+                if (conf.debug) {
+                        for (i = 0; i < repo.keyCount; i++) {
+                                var = sprintf(scratch, "  %3d,%s\n", repo.key[i].id, repo.key[i].key);
+                                send_proc(monConn, scratch, var);
+                        }
+                }
+        }
+
+        //
         // If specified, validate server IP addresses or resolve names into IP addresses
         //
         for (i = 0; i < repo.serverCount; i++) {
                 if ((var = sock_mgmt(-1, repo.server[i].name, 0, repo.server[i].ip, SMA_LOOKUP)) != 0) {
                         send_proc(errConn, scratch, var);
-                        appstatus = -1;
+                        appstatus = STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                         if (!repo.isServer && conf.jsonOutput) {
                                 tspeccpy(&conn[errConn].endTime, &repo.systemClock); // Schedule immediate exit
                         } else {
-                                sig_exit = 1;
+                                sig_exit = TRUE;
                         }
                         break;
                 }
@@ -466,35 +499,33 @@ int main(int argc, char **argv) {
         // If server, create a connection for control port to process inbound setup requests,
         // else create connections for client testing and send setup requests to server(s)
         //
-        if (appstatus == 0) {
+        if (appstatus == STATUS_ERROR) { // If still set to default error status (i.e., no explicit errors so far)
                 if (repo.isServer) {
                         if ((i = new_conn(-1, repo.server[0].ip, repo.server[0].port, T_UDP, &recv_proc, &service_setupreq)) < 0) {
-                                appstatus = -1;
-                                sig_exit  = 1;
+                                appstatus = STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
+                                sig_exit  = TRUE;
                         } else if (conf.verbose) {
                                 var =
                                     sprintf(scratch, "[%d]Awaiting setup requests on %s:%d\n", i, conn[i].locAddr, conn[i].locPort);
                                 send_proc(monConn, scratch, var);
                         }
-                        if (conf.oneTest)
-                                appstatus = -1; // Default to hard error, require explicit end time status success
                 } else {
                         var2 = 0; // Server index (distribute connections across servers)
                         for (j = 0; j < conf.maxConnCount; j++) {
                                 if ((i = new_conn(-1, NULL, 0, T_UDP, &recv_proc, &service_setupresp)) < 0) {
-                                        appstatus = -1;
+                                        appstatus = STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                                         if (conf.jsonOutput) {
                                                 tspeccpy(&conn[errConn].endTime, &repo.systemClock); // Schedule immediate exit
                                         } else {
-                                                sig_exit = 1;
+                                                sig_exit = TRUE;
                                         }
                                         break;
                                 } else if (send_setupreq(i, j, var2) < 0) {
-                                        appstatus = -1;
+                                        appstatus = STATUS_INIT_ERRBASE + ERROR_INIT_GENERIC;
                                         if (conf.jsonOutput) {
                                                 tspeccpy(&conn[errConn].endTime, &repo.systemClock); // Schedule immediate exit
                                         } else {
-                                                sig_exit = 1;
+                                                sig_exit = TRUE;
                                         }
                                         break;
                                 }
@@ -634,7 +665,7 @@ int main(int argc, char **argv) {
                                                         }
                                                         if (conf.oneTest) { // Shutdown server after one test
                                                                 appstatus = repo.endTimeStatus;
-                                                                sig_exit  = 1;
+                                                                sig_exit  = TRUE;
                                                         }
                                                 } else {
                                                         if (i == aggConn) {
@@ -643,7 +674,7 @@ int main(int argc, char **argv) {
                                                                 } else {
                                                                         appstatus = repo.endTimeStatus;
                                                                 }
-                                                                sig_exit = 1;
+                                                                sig_exit = TRUE;
                                                         } else if (conn[i].testAction == TEST_ACT_TEST) {
                                                                 // Decrement active test count if closed while active
                                                                 if (--repo.actConnCount < 0)
@@ -753,7 +784,7 @@ void signal_exit(int signal) {
         //
         // Set exit signal indicator
         //
-        sig_exit = 1;
+        sig_exit = TRUE;
 
         return;
 }
@@ -763,7 +794,7 @@ void signal_exit(int signal) {
 //
 int proc_parameters(int argc, char **argv, int fd) {
         int i, j, var, value;
-        char *lbuf, *optstring = "ud46C:x1evsf:jTDXSB:ri:oRa:m:I:t:P:p:A:b:L:U:F:c:h:q:E:Ml:k:?";
+        char *lbuf, *optstring = "ud46C:x1evsf:jTDXSO:B:ri:oRa:y:K:m:I:t:P:p:A:b:L:U:F:c:h:q:E:Ml:k:?";
 
         //
         // Clear configuration and global repository data
@@ -789,7 +820,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_CONTROL_PORT, MAX_CONTROL_PORT)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.controlPort = value;
                         break;
@@ -806,7 +837,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                 if (repo.serverCount >= MAX_MC_COUNT) {
                         var = sprintf(scratch, "ERROR: Server count exceeds maximum (%d)\n", MAX_MC_COUNT);
                         var = write(fd, scratch, var);
-                        return -1;
+                        return ERROR_CONF_GENERIC;
                 }
                 //
                 // Parse IP address/port as: <IPv4>, <IPv4>:<port>, <IPv6>, or [<IPv6>]:<port> (see RFC5952)
@@ -819,7 +850,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (lbuf == NULL || *lbuf != ':') {
                                 var = sprintf(scratch, "ERROR: Invalid format for IPv6 address with port number\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         var++;
                 } else if ((lbuf = strchr(argv[j], ':')) != NULL) {
@@ -834,7 +865,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                                 value   = atoi(lbuf); // Convert to numeric
                                 if ((var = param_error(value, MIN_CONTROL_PORT, MAX_CONTROL_PORT)) > 0) {
                                         var = write(fd, scratch, var);
-                                        return -1;
+                                        return ERROR_CONF_GENERIC;
                                 }
                         }
                 }
@@ -849,18 +880,18 @@ int proc_parameters(int argc, char **argv, int fd) {
         if (conf.usTesting && conf.dsTesting) {
                 var = sprintf(scratch, "ERROR: %s and %s options are mutually exclusive\n", USTEST_TEXT, DSTEST_TEXT);
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         } else if (!conf.usTesting && !conf.dsTesting) {
                 repo.isServer = TRUE;
                 if (repo.serverCount > 1) {
                         var = sprintf(scratch, "ERROR: Server only allows one local bind address or hostname\n");
                         var = write(fd, scratch, var);
-                        return -1;
+                        return ERROR_CONF_GENERIC;
                 }
         } else if (repo.serverCount == 0) {
                 var = sprintf(scratch, "ERROR: Server hostname or IP address required when client\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
 
         //
@@ -905,8 +936,9 @@ int proc_parameters(int argc, char **argv, int fd) {
         //
         repo.epollFD       = -1;           // No file descriptor
         repo.maxConnIndex  = -1;           // No connections allocated
-        repo.endTimeStatus = STATUS_ERROR; // Default to hard error, require explicit success
+        repo.endTimeStatus = STATUS_ERROR; // Default to unspecified error, require explicit success
         repo.intfFD        = -1;           // No file descriptor
+        repo.keyIndex      = -1;           // No key index (used when client)
 
         //
         // Parse remaining parameters
@@ -927,21 +959,21 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Multi-connection count only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         if ((lbuf = strchr(optarg, '-')) != NULL)
                                 *lbuf = '\0';
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_MC_COUNT, MAX_MC_COUNT)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.minConnCount = value;
                         if (lbuf != NULL) {
                                 value = atoi(++lbuf);
                                 if ((var = param_error(value, MIN_MC_COUNT, MAX_MC_COUNT)) > 0) {
                                         var = write(fd, scratch, var);
-                                        return -1;
+                                        return ERROR_CONF_GENERIC;
                                 }
                         } else { // No max specified
                                 if (value < repo.serverCount)
@@ -950,7 +982,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (value < repo.serverCount) {
                                 var = sprintf(scratch, "ERROR: Maximum multi-connection count must be >= server count\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.maxConnCount = value;
                         break;
@@ -958,7 +990,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (!repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Execution as daemon only valid when server\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.isDaemon = TRUE;
                         break;
@@ -966,7 +998,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (!repo.isServer) {
                                 var = sprintf(scratch, "ERROR: One test execution only valid when server\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.oneTest = TRUE;
                         break;
@@ -983,7 +1015,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Ouput format options only available to client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         if (strcasecmp(optarg, "json") == 0) {
                                 conf.jsonOutput = TRUE;
@@ -996,7 +1028,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         } else {
                                 var = sprintf(scratch, "ERROR: '%s' is not a valid output format\n", optarg);
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         break;
                 case 'j':
@@ -1014,6 +1046,14 @@ int proc_parameters(int argc, char **argv, int fd) {
                 case 'S':
                         conf.showSendingRates = TRUE;
                         break;
+                case 'O':
+                        if (conf.usTesting && !repo.isServer) {
+                                var = sprintf(scratch, "ERROR: Client output file only valid for downstream testing\n");
+                                var = write(fd, scratch, var);
+                                return ERROR_CONF_GENERIC;
+                        }
+                        conf.outputFile = optarg;
+                        break;
                 case 'B':
                         if (repo.isServer) {
                                 var = MAX_SERVER_BW;
@@ -1023,7 +1063,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_REQUIRED_BW, var)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.maxBandwidth = value;
                         break;
@@ -1034,7 +1074,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_BIMODAL_COUNT, MAX_BIMODAL_COUNT)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.bimodalCount = value;
                         break;
@@ -1042,7 +1082,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: One-Way Delay option only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.useOwDelVar = !DEF_USE_OWDELVAR; // Not the default
                         break;
@@ -1050,7 +1090,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Option to ignore Out-of-Order/Duplicates only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.ignoreOooDup = !DEF_IGNORE_OOODUP; // Not the default
                         break;
@@ -1059,14 +1099,42 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (strlen(optarg) > AUTH_KEY_SIZE) {
                                 var = sprintf(scratch, "ERROR: Authentication key exceeds %d characters\n", AUTH_KEY_SIZE);
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         strncpy(conf.authKey, optarg, AUTH_KEY_SIZE + 1);
                         conf.authKey[AUTH_KEY_SIZE] = '\0';
 #else
-                        var = sprintf(scratch, "ERROR: Built without authentication functionality\n");
+                        var = sprintf(scratch, NOAUTH_TEXT);
                         var = write(fd, scratch, var);
-                        return -1;
+                        return ERROR_CONF_GENERIC;
+#endif
+                        break;
+                case 'y':
+#ifdef AUTH_KEY_ENABLE
+                        if (repo.isServer) {
+                                var = sprintf(scratch, "ERROR: Authentication key ID only set by client\n");
+                                var = write(fd, scratch, var);
+                                return ERROR_CONF_GENERIC;
+                        }
+                        value = atoi(optarg);
+                        if ((var = param_error(value, MIN_KEY_ID, MAX_KEY_ID)) > 0) {
+                                var = write(fd, scratch, var);
+                                return ERROR_CONF_GENERIC;
+                        }
+                        conf.keyId = value;
+#else
+                        var = sprintf(scratch, NOAUTH_TEXT);
+                        var = write(fd, scratch, var);
+                        return ERROR_CONF_GENERIC;
+#endif
+                        break;
+                case 'K':
+#ifdef AUTH_KEY_ENABLE
+                        conf.keyFile = optarg;
+#else
+                        var = sprintf(scratch, NOAUTH_TEXT);
+                        var = write(fd, scratch, var);
+                        return ERROR_CONF_GENERIC;
 #endif
                         break;
                 case 'm':
@@ -1074,7 +1142,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = (int) strtol(optarg, NULL, 0); // Allow hex values (0x00-0xff)
                         if ((var = param_error(value, MIN_IPTOS_BYTE, MAX_IPTOS_BYTE)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.ipTosByte = value;
                         break;
@@ -1088,7 +1156,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = atoi(lbuf);
                         if ((var = param_error(value, MIN_SRINDEX_CONF, MAX_SRINDEX_CONF)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.srIndexConf = value;
                         break;
@@ -1097,7 +1165,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_TESTINT_TIME, MAX_TESTINT_TIME)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.testIntTime = value;
                         break;
@@ -1105,12 +1173,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Sub-interval period only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_SUBINT_PERIOD, MAX_SUBINT_PERIOD)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.subIntPeriod = value;
                         break;
@@ -1118,7 +1186,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Rate adjustment algorithm only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = 0;
                         for (var = CHTA_RA_ALGO_MIN; var <= CHTA_RA_ALGO_MAX; var++) {
@@ -1132,14 +1200,14 @@ int proc_parameters(int argc, char **argv, int fd) {
                         } else {
                                 var = sprintf(scratch, "ERROR: '%s' is not a valid rate adjustment algorithm\n", optarg);
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         break;
                 case 'b':
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_SOCKET_BUF, MAX_SOCKET_BUF)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.sockSndBuf = conf.sockRcvBuf = value;
                         break;
@@ -1147,12 +1215,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Low delay variation threshold only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_LOW_THRESH, MAX_LOW_THRESH)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.lowThresh = value;
                         break;
@@ -1160,12 +1228,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Upper delay variation threshold only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_UPPER_THRESH, MAX_UPPER_THRESH)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.upperThresh = value;
                         break;
@@ -1173,12 +1241,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Status feedback/trial interval only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_TRIAL_INT, MAX_TRIAL_INT)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.trialInt = value;
                         break;
@@ -1186,12 +1254,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Congestion slow adjustment threshold only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_SLOW_ADJ_TH, MAX_SLOW_ADJ_TH)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.slowAdjThresh = value;
                         break;
@@ -1199,12 +1267,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: High-speed delta only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_HS_DELTA, MAX_HS_DELTA)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.highSpeedDelta = value;
                         break;
@@ -1212,12 +1280,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Sequence error threshold only set by client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_SEQ_ERR_TH, MAX_SEQ_ERR_TH)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.seqErrThresh = value;
                         break;
@@ -1225,7 +1293,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Local interface option only available to client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         strncpy(conf.intfName, optarg, IFNAMSIZ + 1);
                         conf.intfName[IFNAMSIZ] = '\0';
@@ -1234,7 +1302,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Maximum from local interface only available to client\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.intfForMax = TRUE;
                         break;
@@ -1242,7 +1310,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (!repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Log file only valid when server\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.logFile = optarg;
                         break;
@@ -1250,12 +1318,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                         if (!repo.isServer) {
                                 var = sprintf(scratch, "ERROR: Log file maximum size only valid when server\n");
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         value = atoi(optarg);
                         if ((var = param_error(value, MIN_LOGFILE_MAX, MAX_LOGFILE_MAX)) > 0) {
                                 var = write(fd, scratch, var);
-                                return -1;
+                                return ERROR_CONF_GENERIC;
                         }
                         conf.logFileMax = value * 1000;
                         break;
@@ -1283,19 +1351,21 @@ int proc_parameters(int argc, char **argv, int fd) {
                                       "       -D           Enable debug output messaging (requires '-v')\n"
                                       "(m)    -X           Randomize datagram payload (else zeroes)\n"
                                       "       -S           Show server sending rate table and exit\n"
+                                      "       -O file      Output (export) file of received load metadata\n"
                                       "       -B mbps      Max bandwidth required by client OR available to server\n"
                                       "       -r           Display loss ratio instead of delivered percentage\n"
                                       "       -i count     Display bimodal maxima (specify initial sub-intervals)\n"
                                       "(c)    -o           Use One-Way Delay instead of RTT for delay variation\n"
                                       "(c)    -R           Include Out-of-Order/Duplicate datagrams\n"
                                       "       -a key       Authentication key (%d characters max)\n"
-                                      "(m,v)  -m value     Packet marking octet (IP_TOS/IPV6_TCLASS) [Default %d]\n"
-                                      "(m,i)  -I [%c]index  Index of sending rate (see '-S') [Default %c0 = <Auto>]\n"
-                                      "(m)    -t time      Test interval time in seconds [Default %d, Max %d]\n",
-                                      AUTH_KEY_SIZE, DEF_IPTOS_BYTE, SRIDX_ISSTART_PREFIX, SRIDX_ISSTART_PREFIX, DEF_TESTINT_TIME,
-                                      MAX_TESTINT_TIME);
+                                      "(c)    -y keyid     Key ID used with authentication key [Default %d]\n"
+                                      "       -K file      Key file containing authentication keys\n"
+                                      "(m,v)  -m value     Packet marking octet (IP_TOS/IPV6_TCLASS) [Default %d]\n",
+                                      AUTH_KEY_SIZE, DEF_KEY_ID, DEF_IPTOS_BYTE);
                         var = write(fd, scratch, var);
                         var = sprintf(scratch,
+                                      "(m,i)  -I [%c]index  Index of sending rate (see '-S') [Default %c0 = <Auto>]\n"
+                                      "(m)    -t time      Test interval time in seconds [Default %d, Max %d]\n"
                                       "(c)    -P period    Sub-interval period in seconds [Default %d]\n"
                                       "       -p port      Default port number used for control [Default %d]\n"
                                       "(c)    -A algo      Rate adjustment algorithm (%s - %s) [Default %s]\n"
@@ -1307,6 +1377,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                                       "(c)    -h delta     High-speed (row adjustment) delta [Default %d]\n"
                                       "(c)    -q seqerr    Sequence error threshold [Default %d]\n"
                                       "(c)    -E intf      Show local interface traffic rate (ex. eth0)\n",
+                                      SRIDX_ISSTART_PREFIX, SRIDX_ISSTART_PREFIX, DEF_TESTINT_TIME, MAX_TESTINT_TIME,
                                       DEF_SUBINT_PERIOD, DEF_CONTROL_PORT, rateAdjAlgo[CHTA_RA_ALGO_MIN],
                                       rateAdjAlgo[CHTA_RA_ALGO_MAX], rateAdjAlgo[DEF_RA_ALGO], DEF_LOW_THRESH, DEF_UPPER_THRESH,
                                       DEF_TRIAL_INT, DEF_SLOW_ADJ_TH, DEF_HS_DELTA, DEF_SEQ_ERR_TH);
@@ -1330,7 +1401,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                                       "(i) = Static OR starting (with '%c' prefix) sending rate index.\n",
                                       DEF_LOGFILE_MAX, SRIDX_ISSTART_PREFIX);
                         var = write(fd, scratch, var);
-                        return -1;
+                        return ERROR_CONF_GENERIC;
                 }
         }
 
@@ -1340,54 +1411,64 @@ int proc_parameters(int argc, char **argv, int fd) {
         if (!repo.isServer && conf.isDaemon) {
                 var = sprintf(scratch, "ERROR: Execution as daemon only valid in server mode\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if ((conf.logFile != NULL) && !conf.isDaemon) {
                 var = sprintf(scratch, "ERROR: Log file only supported when executing as daemon\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (!conf.verbose && conf.debug) {
                 var = sprintf(scratch, "ERROR: Debug only available when used with verbose\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.verbose && conf.jsonOutput) {
                 var = sprintf(scratch, "ERROR: Verbose not available with JSON output format option\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.subIntPeriod > conf.testIntTime) {
                 var = sprintf(scratch, "ERROR: Sub-interval period is greater than test interval time\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.lowThresh > conf.upperThresh) {
                 var = sprintf(scratch, "ERROR: Low delay variation threshold > upper delay variation threshold\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.bimodalCount >= conf.testIntTime / conf.subIntPeriod) {
                 var = sprintf(scratch, "ERROR: Bimodal count must be less than total sub-intervals\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.intfForMax && *conf.intfName == '\0') {
                 var = sprintf(scratch, "ERROR: Maximum from local interface requires local interface option\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
         }
         if (conf.minConnCount > conf.maxConnCount) {
                 var = sprintf(scratch, "ERROR: Minimum connection count > maximum connection count\n");
                 var = write(fd, scratch, var);
-                return -1;
+                return ERROR_CONF_GENERIC;
+        }
+        if (!repo.isServer && (*conf.authKey != '\0' && conf.keyFile != NULL)) {
+                var = sprintf(scratch, "ERROR: Authentication key and key file are mutually exclusive\n");
+                var = write(fd, scratch, var);
+                return ERROR_CONF_GENERIC;
+        }
+        if (conf.keyId != DEF_KEY_ID && (*conf.authKey == '\0' && conf.keyFile == NULL)) {
+                var = sprintf(scratch, "ERROR: Authentication key ID requires authentication key or key file\n");
+                var = write(fd, scratch, var);
+                return ERROR_CONF_GENERIC;
         }
         if (conf.minConnCount == DEF_MC_COUNT && conf.maxConnCount == DEF_MC_COUNT) {
                 // If connection counts not specified bump default to cover provided servers
                 if (repo.serverCount > DEF_MC_COUNT)
                         conf.minConnCount = conf.maxConnCount = repo.serverCount;
         }
-        return 0;
+        return -1;
 }
 //----------------------------------------------------------------------------
 //
@@ -1405,6 +1486,154 @@ int param_error(int param, int min, int max) {
 }
 //----------------------------------------------------------------------------
 //
+// Read and process key file
+//
+int read_keyfile(int fd) {
+        int i, var, value, line, status = -1;
+        FILE *f;
+        char *lbuffer, localbuffer[STRING_SIZE];
+        char *tokens[KEY_ENTRY_FIELDS], *endptr;
+
+        //
+        // Open file
+        //
+        if ((f = fopen(conf.keyFile, "r")) == NULL) {
+                var = sprintf(scratch, "FOPEN ERROR: <%.*s> %s\n", NAME_MAX, conf.keyFile, strerror(errno));
+                var = write(fd, scratch, var);
+                return ERROR_CONF_KEYFILE;
+        }
+
+        //
+        // Process entries
+        //
+        line = 0;
+        while (fgets(localbuffer, STRING_SIZE, f) != NULL) {
+                line++;
+                lbuffer = localbuffer;
+                while (*lbuffer) {
+                        // Skip blank lines and ignore comments
+                        if ((*lbuffer == '\r') || (*lbuffer == '\n') || (*lbuffer == '#')) {
+                                *lbuffer = '\0';
+                                break;
+                        }
+                        lbuffer++;
+                }
+                if (*localbuffer == '\0')
+                        continue;
+
+                //
+                // Break CSV line into tokens and check field count (ignore all tabs and spaces)
+                // Expecting: <keyid>,<key> [#<comment>]
+                //
+                lbuffer = localbuffer;
+                for (i = 0; i < KEY_ENTRY_FIELDS; i++) {
+                        if ((tokens[i] = strtok(lbuffer, ", \t")) == NULL)
+                                break;
+                        lbuffer = NULL;
+                }
+                if (i == 0)
+                        continue;
+                if (i < KEY_ENTRY_FIELDS) {
+                        var    = sprintf(scratch, "ERROR: Key file entry has insufficient field count (line %d)\n", line);
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+
+                //
+                // Validate attributes of key entry
+                //
+                endptr = NULL;
+                value  = (int) strtol(tokens[0], &endptr, 0);
+                if (*endptr != '\0') {
+                        var    = sprintf(scratch, "ERROR: Key file entry has invalid numeric ID (line %d)\n", line);
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+                if (value < MIN_KEY_ID || value > MAX_KEY_ID) {
+                        var    = sprintf(scratch, "ERROR: Key file entry has out-of-range ID (line %d)\n", line);
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+                for (i = 0; i < repo.keyCount; i++) {
+                        if (repo.key[i].id == value) {
+                                var = sprintf(scratch, "ERROR: Key file entry has duplicate ID (line %d)\n", line);
+                                var = write(fd, scratch, var);
+                                break;
+                        }
+                }
+                if (i < repo.keyCount) {
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+                if (strlen(tokens[1]) > AUTH_KEY_SIZE) {
+                        var    = sprintf(scratch, "ERROR: Key file entry has oversized key (line %d)\n", line);
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+                if (repo.keyCount >= MAX_KEY_ENTRIES) {
+                        var    = sprintf(scratch, "ERROR: Key file entry count exceeds maximum (line %d)\n", line);
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+                        break;
+                }
+
+                //
+                // Store key entry
+                //
+                i              = repo.keyCount++;
+                repo.key[i].id = value;
+                strncpy(repo.key[i].key, tokens[1], AUTH_KEY_SIZE + 1);
+                repo.key[i].key[AUTH_KEY_SIZE] = '\0';
+
+                //
+                // If client, and key ID matches the one from the command-line (or the default), save the index
+                //
+                if (!repo.isServer) {
+                        if (conf.keyId == repo.key[i].id)
+                                repo.keyIndex = i;
+                }
+        }
+
+        //
+        // Verify keys found and do additional processing if client
+        //
+        if (status == -1) {
+                if (repo.keyCount == 0) {
+                        var    = sprintf(scratch, "ERROR: No authentication keys found in key file\n");
+                        var    = write(fd, scratch, var);
+                        status = ERROR_CONF_KEYFILE;
+
+                } else if (!repo.isServer) {
+                        //
+                        // If only one key in key file, and no explicit key ID from command-line, use that key
+                        //
+                        if (repo.keyCount == 1 && conf.keyId == DEF_KEY_ID) {
+                                conf.keyId    = repo.key[0].id; // Set configured key ID to only key available
+                                repo.keyIndex = 0;              // Set key index to first/only entry
+                        }
+                        //
+                        // Verify that a valid key ID was found in the key file
+                        //
+                        if (repo.keyIndex == -1) {
+                                var    = sprintf(scratch, "ERROR: Authentication key ID (%d) not found in key file\n", conf.keyId);
+                                var    = write(fd, scratch, var);
+                                status = ERROR_CONF_KEYFILE;
+                        }
+                }
+        }
+
+        //
+        // Close file
+        //
+        fclose(f);
+        return status;
+}
+//----------------------------------------------------------------------------
+//
 // Finish JSON processing and output
 //
 int json_finish() {
@@ -1414,10 +1643,6 @@ int json_finish() {
         //
         // Add final items to output object and add it to top-level object
         //
-        // Override a successful test completion if there were any warnings or soft errors
-        //
-        if (repo.endTimeStatus == STATUS_SUCCESS && *json_errbuf != '\0')
-                repo.endTimeStatus = STATUS_WARNING;
         if (json_output) {
                 create_timestamp(&repo.systemClock);
                 cJSON_AddStringToObject(json_output, "EOMTime", scratch);
@@ -1435,6 +1660,7 @@ int json_finish() {
         //
         cJSON_AddNumberToObject(json_top, "ErrorStatus", repo.endTimeStatus);
         cJSON_AddStringToObject(json_top, "ErrorMessage", json_errbuf);
+        cJSON_AddStringToObject(json_top, "ErrorMessage2", json_errbuf2);
 
         //
         // Convert JSON Object to string and output
