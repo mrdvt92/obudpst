@@ -1,5 +1,5 @@
 Name:           udpst
-Version:        8.0.0
+Version:        8.2.0
 Release:        1%{?dist}
 Summary:        Open Broadband-UDP Speed Test
 Group:          Development/Libraries
@@ -61,6 +61,9 @@ systemctl status  udpst --lines=0
 %attr(0644,root,root) %{_unitdir}/%{name}.service
 
 %changelog
+* Mon Aug 26 2024 Michael R. Davis <mrdvt92@yahoo.com> - 8.2.0-1
+- Upstream update
+
 * Tue May 09 2023 Michael R. Davis <mrdvt92@yahoo.com> - 8.0.0-1
 - Upstream update
 
