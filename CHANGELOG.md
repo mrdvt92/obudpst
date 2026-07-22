@@ -3,6 +3,15 @@
 *The udpst utility conforms to TR-471 (Issue 4). The latest TR-471 specification
 can be found at https://www.broadband-forum.org/technical/download/TR-471.pdf*
 
+## 2026-07-22: [UDPST 9.0.1](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.0.1)
+
+Fix for OBUDPST-60: Incorrect statusAuthReuse size
+The overlay structure “statusAuthReuse” in udpst_protocol.h requires another
+16 bytes of reserved space to properly cover the authentication portion of the
+“statusHdr” structure. If the software is compiled with ADD_HEADER_CSUM on
+(which is not the default), the status message receiver will not actually verify
+the header checksum because it will be in the incorrect location.
+
 ## 2026-07-14: [UDPST 9.0.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.0.0)
 
 **IMPORTANT: The default control port has changed from 25000 to 24601. For
