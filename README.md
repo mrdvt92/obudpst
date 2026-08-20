@@ -55,6 +55,7 @@ legacy control port (via `-p 25000`).**
 - [Server Performance Statistics](#server-performance-statistics)
 - [Dual-Phase Testing](#dual-phase-testing)
 - [Explicit Congestion Notification (ECN)](#explicit-congestion-notification-ecn)
+- [Load PDU Receive Coalescing (LPRC)](#load-pdu-receive-coalescing-lprc)
 
 ## Overview
 Utilizing an adaptive transmission rate, via a pre-built table of discreet
@@ -1070,4 +1071,27 @@ for those flows.
 *Note: The CE threshold is an additional input to the existing rate adjustment
 algorithm. The software does not attempt to replicate a standard Classic ECN or
 L4S response; it remains focused on identifying a maximum IP capacity.*
+
+## Load PDU Receive Coalescing (LPRC)
+The LPRC feature introduces an optional eBPF/XDP (Extended Berkeley Packet
+Filter/eXpress Data Path) capability designed to significantly optimize
+receive-side processing for both clients and servers. It is utilized by
+loading the included eBPF program and attaching it to the interfaces
+intended for testing.
+
+Complementing the existing GSO (Generic Segment Offload) transmit optimization,
+LPRC intercepts Load PDUs received by the interface, saves the relevant
+metadata and header as a Receive Event, and then drops the PDUs before full
+protocol stack processing. Once enough Receive Events have been accumulated to
+fill a large datagram, they are packed into a single payload and passed up the
+stack for bulk processing by udpst.
+
+LPRC can be thought of as a highly specialized version of GRO (Generic Receive
+Offload). However, where GRO can only aggregate multiple received packets for a
+flow opportunistically, LPRC is specifically designed to maximize the
+consolidation of Load PDUs for udpst. As such, testing has shown the
+performance improvements to be significantly better than standard GRO.
+
+The software and support files are available in the `eBPF/` directory. See the
+included README file for additional details and usage information.
 

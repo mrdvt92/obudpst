@@ -83,6 +83,7 @@
  * Len Ciavattone          01/15/2026    Realign legacy status messages
  * Len Ciavattone          03/20/2026    Renamed var(s) to match RFC 9946
  * Len Ciavattone          04/19/2026    Add ECN CE support
+ * Len Ciavattone          07/25/2026    Add Load PDU Receive Coalescing
  *
  */
 
@@ -843,9 +844,16 @@ int service_loadpdu(int connindex) {
         }
 
         //
+        // Use current time as receive time if Load PDU Receive Coalescing not active
+        //
+        if (!c->eBpfLprc) {
+                tspeccpy(&repo.rcvLPduTime, &repo.systemClock);
+        }
+
+        //
         // Save receive time for this PDU
         //
-        tspeccpy(&c->pduRxTime, &repo.systemClock);
+        tspeccpy(&c->pduRxTime, &repo.rcvLPduTime);
 
         //
         // Generate warning if peer indicates receive traffic has stopped
@@ -945,12 +953,12 @@ int service_loadpdu(int connindex) {
         //
         tspecvar.tv_sec  = (time_t) ntohl(lHdr->lpduTime_sec);
         tspecvar.tv_nsec = (long) ntohl(lHdr->lpduTime_nsec);
-        tspecminus(&repo.systemClock, &tspecvar, &tspecdelta);
+        tspecminus(&repo.rcvLPduTime, &tspecvar, &tspecdelta);
         delta = (int) tspecmsec(&tspecdelta);
         if (c->outputFPtr != NULL) { // Start output data with one-way values (store in scratch2 for below)
                 sprintf(scratch2, "%u,%u,%d,%ld.%06ld,%ld.%06ld,%d,%.2f,%.2f", seqno, payload, repo.rcvEcnBits,
-                        (long) tspecvar.tv_sec, tspecvar.tv_nsec / NSECINUSEC, (long) repo.systemClock.tv_sec,
-                        repo.systemClock.tv_nsec / NSECINUSEC, delta, repo.intfMbps, repo.intfMbpsAlt);
+                        (long) tspecvar.tv_sec, tspecvar.tv_nsec / NSECINUSEC, (long) repo.rcvLPduTime.tv_sec,
+                        repo.rcvLPduTime.tv_nsec / NSECINUSEC, delta, repo.intfMbps, repo.intfMbpsAlt);
         }
         if (var > 0) {
                 if (c->outputFPtr != NULL && conf.outputFileAll) { // Finalize output data with nulls (use scratch2 from above)
@@ -966,7 +974,7 @@ int service_loadpdu(int connindex) {
         tspecvar.tv_sec  = (time_t) ntohl(lHdr->spduTime_sec);
         tspecvar.tv_nsec = (long) ntohl(lHdr->spduTime_nsec);
         if (tspecvar.tv_nsec != c->spduTime.tv_nsec || tspecvar.tv_sec != c->spduTime.tv_sec) {
-                tspecminus(&repo.systemClock, &tspecvar, &tspecdelta);
+                tspecminus(&repo.rcvLPduTime, &tspecvar, &tspecdelta);
                 uvar = (unsigned int) tspecmsec(&tspecdelta);
                 //
                 // Adjust RTT based on delay between when status PDU was received and load PDU sent
@@ -990,8 +998,8 @@ int service_loadpdu(int connindex) {
                 }
                 if (c->outputFPtr != NULL) { // Finalize output data with RTT values (use scratch2 from above)
                         fprintf(c->outputFPtr, "%s,%ld.%06ld,%ld.%06ld,%u,%u,%d\n", scratch2, (long) tspecvar.tv_sec,
-                                tspecvar.tv_nsec / NSECINUSEC, (long) repo.systemClock.tv_sec,
-                                repo.systemClock.tv_nsec / NSECINUSEC, rttrd, uvar, c->spduSeqErr);
+                                tspecvar.tv_nsec / NSECINUSEC, (long) repo.rcvLPduTime.tv_sec,
+                                repo.rcvLPduTime.tv_nsec / NSECINUSEC, rttrd, uvar, c->spduSeqErr);
                 }
                 //
                 // Check for new minimum
@@ -2579,6 +2587,78 @@ int service_recvmmsg(int connindex) {
                         repo.rcvEcnBits = mmsgEcnBits[i]; // Global ECN value
                 service_loadpdu(connindex);
                 repo.rcvDataPtr += RCV_HEADER_SIZE;
+        }
+        if (conf.psFile != NULL) { // Update performance statistics
+                if (i > 0) {
+                        psA->rxBurstCount++;
+                        psA->rxBurstTotal += (unsigned int) i;
+                        if ((unsigned int) i > psM->rxBurstSize)
+                                psM->rxBurstSize = (unsigned int) i;
+                }
+        }
+        return 0;
+}
+//----------------------------------------------------------------------------
+//
+// Service LPRC receive events from eBPF/XDP program
+//
+int service_recvlprc(int connindex) {
+        register struct connection *c = &conn[connindex];
+        int i, var;
+        struct lprcRxEvent *lRE       = (struct lprcRxEvent *) repo.defBuffer;
+        struct perfStatsAverages *psA = &repo.psAverages;
+        struct perfStatsMaximums *psM = &repo.psMaximums;
+        struct timespec tspecvar;
+        char connid[8];
+
+        //
+        // Verify LPRC receive event(s)
+        //
+        *connid = '\0';
+        if (conf.verbose)
+                sprintf(connid, "[%d]", connindex);
+        //
+        i = MAX_TPAYLOAD_SIZE; // Maximum LPRC payload size
+        if (c->ipProtocol == IPPROTO_IPV6) {
+                i -= IPV6_ADDSIZE;
+        }
+        var = 0;
+        if (repo.rcvDataSize < (int) LPRC_RXEVENT_SIZE) { // Minimum size for one receive event
+                var = sprintf(scratch, "%sERROR: Invalid LPRC receive event size (%d)\n", connid, repo.rcvDataSize);
+
+        } else if (lRE->pduId == htons(LOAD_ID) && repo.rcvDataSize > i) { // Raw Load PDU only received with IP fragmentation
+                var = sprintf(scratch, "%sERROR: LPRC incompatible with IP fragmentation (disable jumbo sizes or increase MTU)\n",
+                              connid);
+
+        } else if (lRE->pduId != LPRC_ID) { // ntohs/htons not needed
+                var = sprintf(scratch, "%sERROR: Invalid LPRC receive event ID (%04X)\n", connid, ntohs(lRE->pduId));
+        }
+        if (var > 0) {
+                if (!repo.isServer || conf.verbose) {
+                        send_proc(errConn, scratch, var);
+                }
+                tspeccpy(&c->endTime, &repo.systemClock); // End testing
+                return 0;
+        }
+
+        //
+        // Process LPRC receive event(s)
+        //
+        var = repo.rcvDataSize;
+        for (i = 0; var >= (int) LPRC_RXEVENT_SIZE && lRE->pduId == LPRC_ID; i++) { // ntohs/htons not needed
+                if (lRE->statusVal != LPRC_STATUS_OK)
+                        break;
+                if (c->ecnCEThresh > 0)
+                        repo.rcvEcnBits = (int) lRE->dscpEcn; // Global ECN value
+                tspecvar.tv_sec  = 0;
+                tspecvar.tv_nsec = (long) lRE->lpduAge;
+                tspecminus(&repo.systemClock, &tspecvar, &repo.rcvLPduTime); // Global Load PDU rx time
+
+                repo.rcvDataPtr  = (char *) &lRE->lHdr;    // Global data pointer
+                repo.rcvDataSize = sizeof(struct loadHdr); // Global data size
+                service_loadpdu(connindex);
+                lRE++;
+                var -= LPRC_RXEVENT_SIZE;
         }
         if (conf.psFile != NULL) { // Update performance statistics
                 if (i > 0) {

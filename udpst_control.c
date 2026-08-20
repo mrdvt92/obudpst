@@ -74,6 +74,7 @@
  * Len Ciavattone          12/12/2025    Add sending rate adj. suppression
  * Len Ciavattone          03/20/2026    Renamed var(s) to match RFC 9946
  * Len Ciavattone          04/19/2026    Add ECN CE support
+ * Len Ciavattone          07/25/2026    Add Load PDU Receive Coalescing
  *
  */
 
@@ -158,6 +159,7 @@ extern cJSON *json_top, *json_output;
 #define TESTHDR_LINE                                                                                                 \
         "%s%s Test Int(sec): %d, DelayVar Th(ms): %d-%d [%s], Trial Int(ms): %d, Ignore OoO/Dup: %s, Payload: %s,\n" \
         "  ID: %d, SR Index: %s, Cong. Th: %d, HS Delta: %d, SeqErr Th: %d, Algo: %s, Conn: %d, DSCP+ECN: %d, CE Th: %d%s\n"
+#define EBPF_TEXT "[%d]Local eBPF/XDP program signaled LPRC (Load PDU Receive Coalescing)\n"
 
 //----------------------------------------------------------------------------
 // Function definitions
@@ -840,6 +842,18 @@ int service_actreq(int connindex) {
         struct perfStatsCounters *psC = &repo.psCounters;
 
         //
+        // Check for eBPF signaling that Load PDU Receive Coalescing is active
+        //
+        if (repo.rcvDataSize >= (int) CHTA_SIZE_MVER && repo.rcvDataSize <= (int) CHTA_SIZE_CVER) {
+                if (ntohs(cHdrTA->pduId) == CHTA_ID_LPRC) { // Check for eBPF signaling ID
+                        if (cHdrTA->cmdRequest == CHTA_CREQ_TESTACTUS && cHdrTA->cmdResponse == CHTA_CRSP_NONE) {
+                                cHdrTA->pduId = htons(CHTA_ID); // Restore official ID for verification
+                                c->eBpfLprc   = TRUE;
+                        }
+                }
+        }
+
+        //
         // Verify PDU
         //
         getnameinfo((struct sockaddr *) &repo.remSas, repo.remSasLen, addrstr, INET6_ADDR_STRLEN, portstr, sizeof(portstr),
@@ -874,6 +888,10 @@ int service_actreq(int connindex) {
         // Update global address info with client address/port number and connect socket
         //
         if (conf.verbose) {
+                if (c->eBpfLprc) {
+                        var = sprintf(scratch, EBPF_TEXT, connindex);
+                        send_proc(monConn, scratch, var);
+                }
                 var = sprintf(scratch, "[%d]Test activation request (%d.%d) received from %s:%s\n", connindex, c->mcIndex,
                               c->mcIdent, addrstr, portstr);
                 send_proc(monConn, scratch, var);
@@ -1128,11 +1146,15 @@ int service_actreq(int connindex) {
                         c->testType     = TEST_TYPE_US;
                         c->rttMinimum   = STATUS_NODEL;
                         c->rttVarSample = STATUS_NODEL;
+                        if (c->eBpfLprc) {
+                                c->secAction = &service_recvlprc;
+                        } else {
 #ifdef HAVE_RECVMMSG
-                        c->secAction = &service_recvmmsg;
+                                c->secAction = &service_recvmmsg;
 #else
-                        c->secAction = &service_loadpdu;
+                                c->secAction = &service_loadpdu;
 #endif
+                        }
                         c->delayVarMin = STATUS_NODEL;
                         tspeccpy(&c->trialIntClock, &repo.systemClock);
                         tspecvar.tv_sec  = 0;
@@ -1242,6 +1264,18 @@ int service_actresp(int connindex) {
         struct controlHdrTA *cHdrTA = (struct controlHdrTA *) repo.defBuffer;
 
         //
+        // Check for eBPF signaling Load PDU Receive Coalescing
+        //
+        if (repo.rcvDataSize == CHTA_SIZE_CVER) {
+                if (ntohs(cHdrTA->pduId) == CHTA_ID_LPRC) { // Check for eBPF signaling ID
+                        if (cHdrTA->cmdRequest == CHTA_CREQ_TESTACTDS && cHdrTA->cmdResponse == CHTA_CRSP_ACKOK) {
+                                cHdrTA->pduId = htons(CHTA_ID); // Restore official ID for verification
+                                c->eBpfLprc   = TRUE;
+                        }
+                }
+        }
+
+        //
         // Verify PDU
         //
         if (!verify_ctrlpdu(connindex, NULL, cHdrTA, NULL, NULL)) {
@@ -1288,6 +1322,10 @@ int service_actresp(int connindex) {
                 return 0;
         }
         if (conf.verbose) {
+                if (c->eBpfLprc) {
+                        var = sprintf(scratch, EBPF_TEXT, connindex);
+                        send_proc(monConn, scratch, var);
+                }
                 var = sprintf(scratch, "[%d]Test activation response (%d.%d) received from %s:%d\n", connindex, c->mcIndex,
                               c->mcIdent, c->remAddr, c->remPort);
                 send_proc(monConn, scratch, var);
@@ -1383,11 +1421,15 @@ int service_actresp(int connindex) {
                 testtype        = DSTEST_TEXT;
                 c->rttMinimum   = STATUS_NODEL;
                 c->rttVarSample = STATUS_NODEL;
+                if (c->eBpfLprc) {
+                        c->secAction = &service_recvlprc;
+                } else {
 #ifdef HAVE_RECVMMSG
-                c->secAction = &service_recvmmsg;
+                        c->secAction = &service_recvmmsg;
 #else
-                c->secAction = &service_loadpdu;
+                        c->secAction = &service_loadpdu;
 #endif
+                }
                 c->delayVarMin = STATUS_NODEL;
                 tspeccpy(&c->trialIntClock, &repo.systemClock);
                 tspecvar.tv_sec  = 0;
