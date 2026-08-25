@@ -17,6 +17,12 @@ another 16 bytes of reserved space to properly cover the authentication portion
 of the “statusHdr” structure. If the software is compiled with ADD_HEADER_CSUM
 on (which is not the default), the status message receiver will not actually
 verify the header checksum because it will be in the incorrect location.
+* Enhancement for OBUDPST-61: The ability to bind the client to a specific
+interface. The local interface option `-E [+]intf` has been extended to support
+an optional '+' prefix. The use of the prefix character indicates that, in
+addition to the existing functionality, the socket should also be bound to the
+specified interface via the `SO_BINDTODEVICE` socket option. This forces traffic
+out of the specified interface, bypassing normal routing.
 
 ## 2026-07-14: [UDPST 9.0.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.0.0)
 

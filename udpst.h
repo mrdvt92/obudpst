@@ -48,7 +48,7 @@
 //
 // General
 //
-#define SOFTWARE_VER       "9.1.0(Dev)"
+#define SOFTWARE_VER       "9.1.0(Dev1)"
 #define SOFTWARE_TITLE     "UDP Speed Test"
 #define USTEST_TEXT        "Upstream"
 #define DSTEST_TEXT        "Downstream"
@@ -304,6 +304,7 @@ struct configuration {
         int maxBandwidth;                // Required OR available bandwidth
         BOOL intfForMax;                 // Local interface used for maximum
         char intfName[IFNAMSIZ + 4];     // Local interface for supplemental data
+        BOOL intfBind;                   // Local interface bind required
         int logFileMax;                  // Maximum log file size
         char *logFile;                   // Name of log file
         char *outputFile;                // Name of output (export) file

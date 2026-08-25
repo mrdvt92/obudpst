@@ -461,7 +461,7 @@ non-blocking console writes.*
 
 ## Local Interface Traffic Rate
 Where applicable, it is possible to also output the local interface traffic
-rate (in Mbps) via the `-E intf` option. This can be informative when trying
+rate (in Mbps) via the `-E [+]intf` option. This can be informative when trying
 to account for external traffic that may be consuming a non-trivial amount of
 the interface bandwidth and competing with the measurement traffic. The rate is
 obtained by querying the specific interface byte counters that correspond with
@@ -471,12 +471,17 @@ for downstream tests). These values are obtained from the sysfs path
 also available to override normal behavior and use the interface rate instead
 of the measurement traffic to determine a maximum.
 
-When the `-E intf` option is utilized, the console output will show the
+When the `-E [+]intf` option is utilized, the console output will show the
 interface name in square brackets in the header info and the Ethernet rate of
 the interface in square brackets after the L3/IP measured rate. When JSON
 output is also enabled, the interface name appears in "Interface" and the
 interface rate is in "InterfaceEthMbps". When this option is not utilized,
 these JSON fields will contain an empty string and zero respectively.
+
+*Note: The use of the optional '+' prefix character indicates that, in addition
+to the behavior already described, the socket should also be bound to the
+specified interface. This bypasses normal routing and forces the test to use
+this interface.*
 
 ## Server Bandwidth Management
 The `-B mbps` option can be used on a server to designate a maximum available
@@ -798,7 +803,7 @@ character:
 - #D - Direction of test ('U' = Upstream, 'D' = Downstream)
 - #H - Server host name (or IP) specified on command-line
 - #p - Control port used for test setup
-- #E - Interface name specified with `-E intf` option (only valid on client)
+- #E - Interface name specified with `-E [+]intf` option (only valid on client)
 
 In addition to the above, all conversion specifications supported by strftime()
 (and introduced by a '%' character) can also be utilized - see strftime()
@@ -823,7 +828,7 @@ receiver's clock).
 - OWD : The one-way delay of the datagram if the sender's and receiver's clocks
 are sufficiently synchronized, else it merely reflects the difference in the
 clocks (and could be negative). This value is in milliseconds.
-- IntfMbps : The client interface Mbps when the `-E intf` option is used.
+- IntfMbps : The client interface Mbps when the `-E [+]intf` option is used.
 - IntfMbpsAlt : The client interface Mbps for the alternate direction.
 - RTTTxTime : The transmit timestamp used for RTT (Round-Trip Time)
 measurements and carried from the load receiver to the load sender in the

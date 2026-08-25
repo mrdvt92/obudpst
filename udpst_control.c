@@ -75,6 +75,7 @@
  * Len Ciavattone          03/20/2026    Renamed var(s) to match RFC 9946
  * Len Ciavattone          04/19/2026    Add ECN CE support
  * Len Ciavattone          07/25/2026    Add Load PDU Receive Coalescing
+ * Len Ciavattone          08/21/2026    Add client interface binding
  *
  */
 
@@ -255,10 +256,20 @@ int send_setupreq(int connindex, int mcIndex, int serverIndex) {
                                         send_proc(errConn, scratch, var);
                                         return -1;
                                 }
-                                if (i == 0)
+                                if (i == 0) {
                                         repo.intfFD = fd;
-                                else
+                                        if (conf.intfBind) { // If specified, bind to local interface
+                                                if (setsockopt(c->fd, SOL_SOCKET, SO_BINDTODEVICE, conf.intfName,
+                                                               strlen(conf.intfName)) < 0) {
+                                                        var = sprintf(scratch, "SO_BINDTODEVICE ERROR: %s (%s)\n", strerror(errno),
+                                                                      conf.intfName);
+                                                        send_proc(errConn, scratch, var);
+                                                        return -1;
+                                                }
+                                        }
+                                } else {
                                         repo.intfFDAlt = fd;
+                                }
                         }
                 }
                 //

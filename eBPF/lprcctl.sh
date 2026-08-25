@@ -93,6 +93,7 @@ elif [ "${1}" == "show" ]; then
 	#
 	echo "Showing program ${progname}..."
 	bpftool prog show name ${progname}
+	bpftool map dump name ${progname:0:8}.rodata | sed -n '/"version"/s/^[ \t]*//p'
 	echo ""
 	echo "Showing attached interfaces..."
 	bpftool net show | sed -e '/tc:/,$d'

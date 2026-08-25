@@ -36,6 +36,7 @@
  * Author                  Date          Comments
  * --------------------    ----------    ----------------------------------
  * Len Ciavattone          07/25/2026    Created
+ * Len Ciavattone          08/25/2026    Add version constant
  *
  */
 #include "vmlinux.h"
@@ -68,6 +69,7 @@
 //
 // Local constants
 // --------------------------------------------------------------------------------------------------
+const char version[] = "v1.0.0"; // Read from BPF map named .rodata (via bpftool)
 //
 #define FLOW_COUNT 8192
 //

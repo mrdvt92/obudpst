@@ -57,6 +57,7 @@ Showing program udpst_lprc...
         loaded_at 2026-08-18T11:28:37-0400  uid 0
         xlated 4000B  jited 2220B  memlock 4096B  map_ids 22,23
         btf_id 169
+"version": "v1.0.0"
 
 Showing attached interfaces...
 xdp:
