@@ -1,8 +1,6 @@
-%define _build_id_links none
-
 Name:           udpst
 Version:        9.0.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Open Broadband-UDP Speed Test
 Group:          Development/Libraries
 License:        BSD 3-Clause
