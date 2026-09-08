@@ -84,6 +84,7 @@
  * Len Ciavattone          03/20/2026    Renamed var(s) to match RFC 9946
  * Len Ciavattone          04/19/2026    Add ECN CE support
  * Len Ciavattone          07/25/2026    Add Load PDU Receive Coalescing
+ * Len Ciavattone          09/08/2026    Sanity check values from server
  *
  */
 
@@ -2922,6 +2923,24 @@ void sr_copy(struct sendingRate *srhost, struct sendingRate *srnet, BOOL hton) {
                 srhost->udpPayload2 = ntohl(srnet->udpPayload2);
                 srhost->burstSize2  = ntohl(srnet->burstSize2);
                 srhost->udpAddon2   = ntohl(srnet->udpAddon2);
+
+                //
+                // Sanity check values from server
+                //
+                if (srhost->txInterval1 > USECINSEC)
+                        srhost->txInterval1 = 0;
+                if ((srhost->udpPayload1 & ~SRATE_RAND_BIT) > MAX_JPAYLOAD_SIZE)
+                        srhost->udpPayload1 = 0;
+                if (srhost->burstSize1 > MAX_BURST_SIZE)
+                        srhost->burstSize1 = 0;
+                if (srhost->txInterval2 > USECINSEC)
+                        srhost->txInterval2 = 0;
+                if ((srhost->udpPayload2 & ~SRATE_RAND_BIT) > MAX_JPAYLOAD_SIZE)
+                        srhost->udpPayload2 = 0;
+                if (srhost->burstSize2 > MAX_BURST_SIZE)
+                        srhost->burstSize2 = 0;
+                if ((srhost->udpAddon2 & ~SRATE_RAND_BIT) > MAX_JPAYLOAD_SIZE)
+                        srhost->udpAddon2 = 0;
         }
         return;
 }

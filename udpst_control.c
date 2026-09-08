@@ -76,6 +76,7 @@
  * Len Ciavattone          04/19/2026    Add ECN CE support
  * Len Ciavattone          07/25/2026    Add Load PDU Receive Coalescing
  * Len Ciavattone          08/21/2026    Add client interface binding
+ * Len Ciavattone          09/08/2026    Sanity check values from server
  *
  */
 
@@ -1350,7 +1351,10 @@ int service_actresp(int connindex) {
         c->trialInt     = (int) ntohs(cHdrTA->trialInt);
         c->testIntTime  = (int) ntohs(cHdrTA->testIntTime);
         c->subIntPeriod = (int) ntohs(cHdrTA->subIntPeriod);
-        c->dscpEcn      = (int) cHdrTA->dscpEcn;
+        if (c->subIntPeriod < MIN_SUBINT_PERIOD || c->subIntPeriod > MAX_SUBINT_PERIOD) { // Sanity check value from server
+                c->subIntPeriod = DEF_SUBINT_PERIOD;
+        }
+        c->dscpEcn = (int) cHdrTA->dscpEcn;
         if (c->dscpEcn != DEF_DSCPECN_BYTE) {
                 if (c->ipProtocol == IPPROTO_IPV6) // Set IP packet marking
                         var = IPV6_TCLASS;
@@ -1376,7 +1380,10 @@ int service_actresp(int connindex) {
         if (!(cHdrTA->modifierBitmap & CHTA_RAND_PAYLOAD)) {
                 c->randPayload = FALSE; // Payload randomization rejected by server
         }
-        c->rateAdjAlgo    = (int) cHdrTA->rateAdjAlgo;
+        c->rateAdjAlgo = (int) cHdrTA->rateAdjAlgo;
+        if (c->rateAdjAlgo < CHTA_RA_ALGO_MIN || c->rateAdjAlgo > CHTA_RA_ALGO_MAX) { // Sanity check value from server
+                c->rateAdjAlgo = DEF_RA_ALGO;
+        }
         c->srAdjSuppCount = (int) ntohs(cHdrTA->reserved4); // Utilizes reserved alignment field
         c->ecnCEThresh    = (int) cHdrTA->reserved2;        // Utilizes reserved alignment field
         if (c->ecnCEThresh != DEF_ECN_CE_TH) {

@@ -48,7 +48,7 @@
 //
 // General
 //
-#define SOFTWARE_VER       "9.1.0(Dev1)"
+#define SOFTWARE_VER       "9.1.0(Dev2)"
 #define SOFTWARE_TITLE     "UDP Speed Test"
 #define USTEST_TEXT        "Upstream"
 #define DSTEST_TEXT        "Downstream"

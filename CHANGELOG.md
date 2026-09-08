@@ -3,7 +3,7 @@
 *The udpst utility conforms to TR-471 (Issue 4). The latest TR-471 specification
 can be found at https://www.broadband-forum.org/technical/download/TR-471.pdf*
 
-## 2026-09-15: [UDPST 9.1.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.1.0)
+## 2026-10-15: [UDPST 9.1.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.1.0)
 
 This release includes a new, completely optional receive optimization: Load PDU
 Receive Coalescing (LPRC). Implemented using eBPF (Extended Berkeley Packet
@@ -23,6 +23,10 @@ an optional '+' prefix. The use of the prefix character indicates that, in
 addition to the existing functionality, the socket should also be bound to the
 specified interface via the `SO_BINDTODEVICE` socket option. This forces traffic
 out of the specified interface, bypassing normal routing.
+* Fix for OBUDPST-62: Client should sanity check several values returned by the
+server. Returned values from the server (including sending rate parameters, the
+rate adjustment algorithm, and sub-interval period) are bounds checked prior to
+usage.
 
 ## 2026-07-14: [UDPST 9.0.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.0.0)
 
