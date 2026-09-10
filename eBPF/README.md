@@ -108,6 +108,33 @@ traffic combined with the particular optimization done with LPRC. This provides
 a huge operational advantage in that **xdpgeneric** can be utilized
 regardless of whether the network driver provides native XDP support.*
 
+## XDP Native / Driver Mode and Network Statistics
+Even when a network interface driver supports **xdpdrv** for LPRC, the
+handling of kernel interface statistics can vary between drivers and driver
+revisions. Historically, this has been a long-standing, explicitly acknowledged
+gap in the XDP ecosystem.
+
+More specifically for udpst, the question is about whether a driver that
+receives a packet and hands it off to an eBPF program that ultimately drops it
+(via `XDP_DROP`) should actually count it as received. The current consensus is
+that XDP is considered the first layer of the protocol stack, so packets
+consumed by XDP should still be counted. However, this is not currently
+universal, and it may take some time for network drivers to converge on this
+expected behavior.
+
+In the interim, when using LPRC, interface statistics on some network drivers
+may not count received udpst Load PDUs that are purposefully dropped. It is
+also possible (as observed during testing) that a network driver may completely
+mishandle its receive-side statistics and produce wildly incorrect received
+packet and byte counts. Although these behaviors do not impact the usefulness
+of LPRC or its performance benefits, they may impact the reliability of the
+udpst `-E [+]intf` option. In these cases, the additional interface statistics
+included with the test results (and sourced from
+`/sys/class/net/<intf>/statistics/rx_bytes`) may be inaccurate.
+
+*Note: These potential counter anomalies should not be an issue when
+**xdpgeneric** is utilized.*
+
 ## UDP Checksum Considerations
 For IPv4, a UDP checksum is optional. Given that newly constructed LPRC
 datagrams are never transmitted anywhere, only passed up the protocol stack,
