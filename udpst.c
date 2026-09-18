@@ -73,6 +73,7 @@
  * Len Ciavattone          10/30/2025    Add export all as optional
  * Len Ciavattone          12/12/2025    Add sending rate adj. suppression
  * Len Ciavattone          04/19/2026    Add ECN CE support
+ * Len Ciavattone          08/21/2026    Add client interface binding
  *
  */
 
@@ -1374,7 +1375,12 @@ int proc_parameters(int argc, char **argv, int fd) {
                                 var = write(fd, scratch, var);
                                 return ERROR_CONF_GENERIC;
                         }
-                        strncpy(conf.intfName, optarg, IFNAMSIZ + 1);
+                        lbuf = optarg;
+                        if (*lbuf == '+') {
+                                lbuf++;
+                                conf.intfBind = TRUE; // Bind to the specified interface
+                        }
+                        strncpy(conf.intfName, lbuf, IFNAMSIZ + 1);
                         conf.intfName[IFNAMSIZ] = '\0';
                         break;
                 case 'M':
@@ -1480,7 +1486,7 @@ int proc_parameters(int argc, char **argv, int fd) {
                                       "(c)    -c thresh    Congestion slow adjustment threshold [Default %d]\n"
                                       "(c)    -h delta     High-speed (row adjustment) delta [Default %d]\n"
                                       "(c)    -q seqerr    Sequence error threshold [Default %d]\n"
-                                      "(c)    -E intf      Show local interface traffic rate (ex. eth0)\n"
+                                      "(c,E)  -E [+]intf   Show local interface traffic rate (ex. eth0)\n"
                                       "(c)    -M           Use local interface rate to determine maximum\n"
                                       "(s)    -l logfile   Log file name when executing as daemon\n"
                                       "(s)    -k logsize   Log file maximum size in KBytes [Default %d]\n"
@@ -1507,7 +1513,8 @@ int proc_parameters(int argc, char **argv, int fd) {
                                       "(i) = Static OR starting (with '%c' prefix) sending rate index.\n"
                                       "(o) = Prefix '+' exports all metadata (not just RTT entries).\n"
                                       "(b) = Prefix '-' suppresses rate adjustments during initial mode.\n"
-                                      "(z) = CE thresholds trigger at >0%%, >%0.1f%%, >%0.1f%%,... >%0.1f%%.\n",
+                                      "(z) = CE thresholds trigger at >0%%, >%0.1f%%, >%0.1f%%,... >%0.1f%%.\n"
+                                      "(E) = Prefix '+' also binds socket to specified interface.\n",
                                       SRIDX_ISSTART_PREFIX, dvar, dvar * 2.0, dvar * (double) (MAX_ECN_CE_TH - 1));
                         var = write(fd, scratch, var);
                         return ERROR_CONF_GENERIC;

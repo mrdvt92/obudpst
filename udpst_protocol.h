@@ -319,5 +319,24 @@ struct statusAuthReuse {        // Start on 32-bit boundary
         uint16_t checkSum;      // Header checksum - DO NOT OVERWRITE
 };
 //----------------------------------------------------------------------------
+//
+// Alternate Test Activation ID used by eBPF to signal Load PDU Receive Coalescing (LPRC)
+//
+#define CHTA_ID_LPRC 0xCAFE
+//
+// LPRC receive event structure (repeated sequentially for each event)
+// ...end of list marked with PDU ID of 0x0000
+//
+struct lprcRxEvent {
+#define LPRC_ID 0xBABE
+        uint16_t pduId;      // PDU ID
+        uint8_t dscpEcn;     // Diffserv and ECN field in IP packet
+#define LPRC_STATUS_OK 0     // Operation successful
+        uint8_t statusVal;   // Status value for LPRC
+        uint32_t lpduAge;    // Age of Load PDU (ns)
+        struct loadHdr lHdr; // Load PDU header
+};
+#define LPRC_RXEVENT_SIZE sizeof(struct lprcRxEvent)
+//----------------------------------------------------------------------------
 
 #endif /* UDPST_PROTOCOL_H */
