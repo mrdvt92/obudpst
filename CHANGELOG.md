@@ -3,7 +3,7 @@
 *The udpst utility conforms to TR-471 (Issue 4). The latest TR-471 specification
 can be found at https://www.broadband-forum.org/technical/download/TR-471.pdf*
 
-## 2026-10-15: [UDPST 9.1.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.1.0)
+## 2026-09-18: [UDPST 9.1.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.1.0)
 
 This release includes a new, completely optional receive optimization: Load PDU
 Receive Coalescing (LPRC). Implemented using eBPF (Extended Berkeley Packet
