@@ -3,6 +3,31 @@
 *The udpst utility conforms to TR-471 (Issue 4). The latest TR-471 specification
 can be found at https://www.broadband-forum.org/technical/download/TR-471.pdf*
 
+## 2026-09-18: [UDPST 9.1.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.1.0)
+
+This release includes a new, completely optional receive optimization: Load PDU
+Receive Coalescing (LPRC). Implemented using eBPF (Extended Berkeley Packet
+Filter) and XDP (eXpress Data Path), LPRC serves as a receive-side complement to
+the existing GSO transmit optimization. For details, see the README file in the
+`eBPF/` directory. Also included in this release...
+
+* Fix for OBUDPST-60: Incorrect statusAuthReuse size (Released on Bitbucket as
+v9.0.1). The overlay structure “statusAuthReuse” in udpst_protocol.h requires
+another 16 bytes of reserved space to properly cover the authentication portion
+of the “statusHdr” structure. If the software is compiled with ADD_HEADER_CSUM
+on (which is not the default), the status message receiver will not actually
+verify the header checksum because it will be in the incorrect location.
+* Enhancement for OBUDPST-61: The ability to bind the client to a specific
+interface. The local interface option `-E [+]intf` has been extended to support
+an optional '+' prefix. The use of the prefix character indicates that, in
+addition to the existing functionality, the socket should also be bound to the
+specified interface via the `SO_BINDTODEVICE` socket option. This forces traffic
+out of the specified interface, bypassing normal routing.
+* Fix for OBUDPST-62: Client should sanity check several values returned by the
+server. Returned values from the server (including sending rate parameters, the
+rate adjustment algorithm, and sub-interval period) are bounds checked prior to
+usage.
+
 ## 2026-07-14: [UDPST 9.0.0](https://github.com/BroadbandForum/OBUDPST/releases/tag/v9.0.0)
 
 **IMPORTANT: The default control port has changed from 25000 to 24601. For

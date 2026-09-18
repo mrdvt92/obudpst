@@ -48,7 +48,7 @@
 //
 // General
 //
-#define SOFTWARE_VER       "9.0.0"
+#define SOFTWARE_VER       "9.1.0"
 #define SOFTWARE_TITLE     "UDP Speed Test"
 #define USTEST_TEXT        "Upstream"
 #define DSTEST_TEXT        "Downstream"
@@ -304,6 +304,7 @@ struct configuration {
         int maxBandwidth;                // Required OR available bandwidth
         BOOL intfForMax;                 // Local interface used for maximum
         char intfName[IFNAMSIZ + 4];     // Local interface for supplemental data
+        BOOL intfBind;                   // Local interface bind required
         int logFileMax;                  // Maximum log file size
         char *logFile;                   // Name of log file
         char *outputFile;                // Name of output (export) file
@@ -422,6 +423,7 @@ struct repository {
         char *rcvDataPtr;                     // Received data pointer for load PDUs
         int rcvDataSize;                      // Received data size in default buffer
         int rcvEcnBits;                       // Received ECN bits in packet header
+        struct timespec rcvLPduTime;          // Receive time of Load PDU
         struct sockaddr_storage remSas;       // Remote IP sockaddr storage
         socklen_t remSasLen;                  // Remote IP sockaddr storage length
         BOOL isServer;                        // Execute as server
@@ -507,6 +509,7 @@ struct connection {
         char remAddr[INET6_ADDR_STRLEN]; // Remote IP address as string
         int remPort;                     // Remote port
         FILE *outputFPtr;                // Output file pointer
+        BOOL eBpfLprc;                   // eBPF for Load PDU Receive Coalescing
         //
         int srIndex;                 // Sending rate index
         struct sendingRate srStruct; // Sending rate structure
