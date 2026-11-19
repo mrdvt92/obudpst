@@ -1,6 +1,6 @@
 Name:           udpst
 Version:        9.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Open Broadband-UDP Speed Test
 Group:          Development/Libraries
 License:        BSD 3-Clause
@@ -57,11 +57,15 @@ systemctl status  udpst --lines=0
 %defattr(0644,root,root,-)
 %attr(0755,root,root) %{_bindir}/%{name}
 %{_mandir}/man1/*
+%license LICENSE
 
 %files server
 %attr(0644,root,root) %{_unitdir}/%{name}.service
 
 %changelog
+* Thu Nov 19 2026 Michael R. Davis <mrdvt92@yahoo.com> - 9.1.0-2
+- Added LICENSE file
+
 * Fri Sep 18 2026 Michael R. Davis <mrdvt92@yahoo.com> - 9.1.0-1
 - Upstream update
 
